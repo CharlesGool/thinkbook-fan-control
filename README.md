@@ -4,6 +4,8 @@
 
 单个 exe，无需安装，只依赖 Windows 自带的 .NET Framework 4.x。
 
+![ThinkBook 风扇控制截图：性能模式下的温度曲线和最近 5 分钟的转速 / 温度记录](docs/screenshot.webp)
+
 ## 使用
 
 1. 从 [Releases](../../releases) 下载 `ThinkBookFanControl.exe`，或按下文自行编译
