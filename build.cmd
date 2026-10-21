@@ -12,3 +12,6 @@ if not exist bin mkdir bin
   /resource:res\pawnio\PawnIO_setup.exe,pawnio.PawnIO_setup.exe ^
   /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Management.dll /r:System.ServiceProcess.dll ^
   src\*.cs
+if errorlevel 1 exit /b 1
+rem tbfc.exe: command-line client for the control port (no admin manifest, so it never asks for UAC).
+"%CSC%" /nologo /target:exe /platform:anycpu /optimize+ /utf8output /codepage:65001 /out:bin\tbfc.exe /r:System.dll cli\Tbfc.cs

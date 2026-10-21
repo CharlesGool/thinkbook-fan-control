@@ -156,10 +156,21 @@ namespace ThinkBookFanControl
                 sb.AppendLine("电源：" + (PowerPlan.OnAc ? "插电" : "电池") + " · 电源模式 " + PowerPlan.ModeName(PowerPlan.CurrentMode) + " · 电源计划 " + PowerPlan.ActiveScheme);
                 var t = FreqLimiter.ReadTable();
                 foreach (PowerMode m in new[] { PowerMode.Efficiency, PowerMode.Balanced, PowerMode.Performance })
-                    sb.AppendLine(string.Format("  {0}：插电 P {1} / E {2} MHz，电池 P {3} / E {4} MHz（0 = 不限）", PowerPlan.ModeName(m),
-                        t[FreqLimiter.Index(m, false, false)], t[FreqLimiter.Index(m, false, true)], t[FreqLimiter.Index(m, true, false)], t[FreqLimiter.Index(m, true, true)]));
+                    sb.AppendLine(string.Format("  {0}：插电 {1} MHz，电池 {2} MHz（PROCFREQMAX1，0 = 不限）", PowerPlan.ModeName(m),
+                        t[FreqLimiter.Index(m, false)], t[FreqLimiter.Index(m, true)]));
                 int ppm = LenovoPpm.Get();
                 sb.AppendLine("  联想进程管理服务 Policy_DisablePPMCtrl：" + (ppm < 0 ? "无此服务" : ppm.ToString()));
+                int dtt = DttComponent.State;
+                sb.AppendLine("  Intel DTT 扩展组件：" + (dtt < 0 ? "无" : dtt == 1 ? "已禁用" : "已启用"));
+                foreach (string svc in new[] { LenovoPpm.ServiceName, "ipfsvc", "dptftcs" })
+                {
+                    int start = ServiceSwitch.StartType(svc);
+                    if (start < 0) continue;
+                    string state;
+                    try { using (var sc = new System.ServiceProcess.ServiceController(svc)) state = sc.Status.ToString(); }
+                    catch (Exception) { state = "?"; }
+                    sb.AppendLine("  服务 " + svc + "：" + state + "，启动类型 " + start + "（2 自动，3 手动，4 禁用）");
+                }
             }
             catch (Exception ex) { sb.AppendLine("电源设置读取失败：" + ex.Message); }
             if (raw != null) raw.Dispose();

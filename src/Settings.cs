@@ -164,9 +164,24 @@ namespace ThinkBookFanControl
         public int Pl1TauS;                 // PL1 time window in seconds, 0 = leave the BIOS value
         public bool HwInfoEnabled = true;   // publish sensors to HWiNFO's custom sensor registry keys
         public bool FreqLimitEnabled;       // keep the P / E core frequency caps below in the Windows power settings
-        public int[] FreqMhz = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 }; // FreqLimiter.Index order, -1 = not chosen yet
+        public int[] FreqMhz = { -1, -1, -1, -1, -1, -1 }; // max MHz per FreqLimiter.Index(mode, battery), 0 = no cap, -1 = not chosen yet
+        public bool AllowBoost = true;      // let the system raise caps / PL for a while after app launches, then restore
+        public int[] FreqMultiMhz = { 0, 0, 0, 0, 0, 0 }; // cap while 2+ cores are busy, same index; 0 = same as single-core
+        public bool EppEnabled;             // keep the energy performance preference below in the Windows power settings
+        public int[] EppPct = { -1, -1, -1, -1, -1, -1 }; // 0 = performance .. 100 = efficiency per FreqLimiter.Index, -1 = not chosen yet
         public bool DcTurbo;                // allow turbo on battery (Lenovo turns it off)
         public int LenovoPpmOriginal = -1;  // Policy_DisablePPMCtrl before we changed it, -1 = we did not
+        public int LpmOriginalStart = -1;   // Lenovo process management service start type before we disabled it, -1 = we did not
+        public int DttExtOriginal = -1;     // 0 = we disabled Intel DTT's extension component (it was enabled), -1 = we did not
+        public bool RemoteEnabled = true;   // command-line control port for tbfc.exe (127.0.0.1)
+        public bool RemoteLan;              // ... also reachable from the LAN
+        public int RemotePort = RemoteServer.DefaultPort;
+        public string RemoteToken = "";     // required by every request; generated on first start
+        public int UiRefreshMs = 1000;      // how often the window's numbers are refreshed
+        public static readonly int[] UiRefreshChoices = { 500, 1000, 2000, 3000 };
+
+        /// <summary>Why the last save failed (null after a good one), shown in the window.</summary>
+        public volatile string SaveError;
 
         /// <summary>The active custom curve profile; Curves / LinkCurves read and write through it.</summary>
         public CurveProfile Profile { get { return Profiles[ActiveProfile]; } }
@@ -227,15 +242,20 @@ namespace ThinkBookFanControl
             if (kv.TryGetValue("FreqLimitEnabled", out v)) s.FreqLimitEnabled = v == "1";
             if (kv.TryGetValue("DcTurbo", out v)) s.DcTurbo = v == "1";
             s.LenovoPpmOriginal = Int(kv, "LenovoPpmOriginal", -1, -1, 1);
-            if (kv.TryGetValue("FreqMhz", out v))
-            {
-                var parts = v.Split(',');
-                for (int i = 0; i < parts.Length && i < s.FreqMhz.Length; i++)
-                {
-                    int n;
-                    if (int.TryParse(parts[i], NumberStyles.Integer, CultureInfo.InvariantCulture, out n)) s.FreqMhz[i] = Clamp(n, -1, FreqMaxMhz);
-                }
-            }
+            s.LpmOriginalStart = Int(kv, "LpmOriginalStart", -1, -1, 4);
+            s.DttExtOriginal = Int(kv, "DttExtOriginal", -1, -1, 0);
+            if (kv.TryGetValue("AllowBoost", out v)) s.AllowBoost = v == "1";
+            if (kv.TryGetValue("RemoteEnabled", out v)) s.RemoteEnabled = v == "1";
+            if (kv.TryGetValue("RemoteLan", out v)) s.RemoteLan = v == "1";
+            s.RemotePort = Int(kv, "RemotePort", s.RemotePort, 1024, 65535);
+            if (kv.TryGetValue("RemoteToken", out v)) s.RemoteToken = v;
+            s.UiRefreshMs = Int(kv, "UiRefreshMs", s.UiRefreshMs, 500, 3000);
+            if (kv.TryGetValue("FreqCapMhz", out v)) ParseFreq(v, s.FreqMhz, 1);
+            else if (kv.TryGetValue("FreqMhz", out v)) ParseFreq(v, s.FreqMhz, 2); // older P / E table: keep the P values
+            if (kv.TryGetValue("FreqMultiMhz", out v)) ParseFreq(v, s.FreqMultiMhz, 1);
+            if (kv.TryGetValue("EppEnabled", out v)) s.EppEnabled = v == "1";
+            if (kv.TryGetValue("EppPct", out v)) { ParseFreq(v, s.EppPct, 1); for (int i = 0; i < s.EppPct.Length; i++) s.EppPct[i] = Clamp(s.EppPct[i], -1, 100); }
+            for (int i = 0; i < s.FreqMultiMhz.Length; i++) s.FreqMultiMhz[i] = Math.Max(0, s.FreqMultiMhz[i]);
             for (int i = 0; i < fans.Count; i++) s.FixedRpm[i] = Int(kv, "Fixed" + fans[i].Id, s.FixedRpm[i], 0, fans[i].MaxRpm);
 
             // Profiles: Profile<n>.Name / .Link / .Curve<fanId>. Older files had a single LinkCurves + Curve<fanId>.
@@ -259,6 +279,17 @@ namespace ThinkBookFanControl
             }
             s.ActiveProfile = Int(kv, "ActiveProfile", 0, 0, s.Profiles.Count - 1);
             return s;
+        }
+
+        /// <summary>Comma list into `into`, taking every `stride`-th value.</summary>
+        private static void ParseFreq(string v, int[] into, int stride)
+        {
+            var parts = v.Split(',');
+            for (int i = 0; i < into.Length && i * stride < parts.Length; i++)
+            {
+                int n;
+                if (int.TryParse(parts[i * stride], NumberStyles.Integer, CultureInfo.InvariantCulture, out n)) into[i] = Clamp(n, -1, FreqMaxMhz);
+            }
         }
 
         private static void ReadCurves(Dictionary<string, string> kv, string prefix, List<FanInfo> fans, CurveProfile p)
@@ -302,9 +333,20 @@ namespace ThinkBookFanControl
                 sb.AppendLine("Pl1TauS=" + Pl1TauS);
                 sb.AppendLine("HwInfoEnabled=" + (HwInfoEnabled ? 1 : 0));
                 sb.AppendLine("FreqLimitEnabled=" + (FreqLimitEnabled ? 1 : 0));
-                sb.AppendLine("FreqMhz=" + string.Join(",", Array.ConvertAll(FreqMhz, x => x.ToString(CultureInfo.InvariantCulture))));
+                sb.AppendLine("FreqCapMhz=" + string.Join(",", Array.ConvertAll(FreqMhz, x => x.ToString(CultureInfo.InvariantCulture))));
+                sb.AppendLine("AllowBoost=" + (AllowBoost ? 1 : 0));
+                sb.AppendLine("FreqMultiMhz=" + string.Join(",", Array.ConvertAll(FreqMultiMhz, x => x.ToString(CultureInfo.InvariantCulture))));
+                sb.AppendLine("EppEnabled=" + (EppEnabled ? 1 : 0));
+                sb.AppendLine("EppPct=" + string.Join(",", Array.ConvertAll(EppPct, x => x.ToString(CultureInfo.InvariantCulture))));
+                sb.AppendLine("RemoteEnabled=" + (RemoteEnabled ? 1 : 0));
+                sb.AppendLine("RemoteLan=" + (RemoteLan ? 1 : 0));
+                sb.AppendLine("RemotePort=" + RemotePort);
+                sb.AppendLine("RemoteToken=" + RemoteToken);
+                sb.AppendLine("UiRefreshMs=" + UiRefreshMs);
                 sb.AppendLine("DcTurbo=" + (DcTurbo ? 1 : 0));
                 sb.AppendLine("LenovoPpmOriginal=" + LenovoPpmOriginal);
+                sb.AppendLine("LpmOriginalStart=" + LpmOriginalStart);
+                sb.AppendLine("DttExtOriginal=" + DttExtOriginal);
                 for (int i = 0; i < fans.Count; i++) sb.AppendLine("Fixed" + fans[i].Id + "=" + FixedRpm[i]);
                 sb.AppendLine("ActiveProfile=" + ActiveProfile);
                 sb.AppendLine("ProfileCount=" + Profiles.Count);
@@ -320,8 +362,9 @@ namespace ThinkBookFanControl
             {
                 Directory.CreateDirectory(Dir);
                 File.WriteAllText(FilePath, sb.ToString(), Encoding.UTF8);
+                SaveError = null;
             }
-            catch (Exception) { }
+            catch (Exception ex) { SaveError = FilePath + "：" + ex.Message; }
         }
 
         public static int Clamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }

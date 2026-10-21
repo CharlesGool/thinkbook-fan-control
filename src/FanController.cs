@@ -24,6 +24,13 @@ namespace ThinkBookFanControl
         public bool OnAc;
         public int FreqP = -1, FreqE = -1;
         public bool TurboOff;           // PERFBOOSTMODE = 0 in the current state
+        public bool FreqBoosting, PowerBoosting; // the system raised caps / PL after an app launch (allowed, restored afterwards)
+        public int BoostSecondsLeft;    // app-launch boost window, 0 = none
+        public double BusyCores = double.NaN; // busy time of all logical processors added up, in cores (NaN = unknown)
+        public bool MultiCoreLoad;      // the all-core-load frequency caps are in use
+        public int EppNow = -1;         // EPP that applies right now (0 = performance .. 100 = efficiency), -1 = unknown
+        public int EppCorrections;      // EPP values somebody else changed back within the last minute
+        public string EppError;
         public int FreqCorrections;     // values somebody else changed back within the last minute
         public string FreqError;
         public bool HwInfoNeedsRestart; // HWiNFO is running but was started before our sensors existed
@@ -52,7 +59,7 @@ namespace ThinkBookFanControl
         private readonly System.Diagnostics.Stopwatch _clock = System.Diagnostics.Stopwatch.StartNew();
         private readonly System.Diagnostics.Stopwatch _tickClock = System.Diagnostics.Stopwatch.StartNew();
         private readonly Queue<int> _tempWindow = new Queue<int>();
-        private long _tempSampledAt = long.MinValue, _tempOkAt;
+        private long _tempSampledAt = long.MinValue / 2, _tempOkAt; // "/ 2": now - sentinel must not overflow
         private double _curveTemp = double.NaN;
         private bool _failsafe;
         private bool _lowActive;
@@ -66,6 +73,7 @@ namespace ThinkBookFanControl
         private int _plTriedPl1, _plTriedPl2, _plTriedTau;
         private long _plTriedAt = long.MinValue / 2;
         private string _plError;
+        private bool _plWasBoosting;
 
         private HwInfoPublisher _hwinfo;
         private long _hwinfoCheckedAt = long.MinValue / 2;
@@ -76,12 +84,34 @@ namespace ThinkBookFanControl
         private int[] _freqLast;            // table at the last enforce (null = not enforcing)
         private bool _freqLastTurbo;
         private long _freqCheckedAt = long.MinValue / 2;
-        private volatile bool _freqForce;
+        private volatile bool _freqForce, _eppForce;
         private readonly List<long> _freqCorrections = new List<long>();
         private string _freqError;
         private const int FreqCheckMs = 5000;
-        private const int FreqReactMs = 200;  // at most this often when the watcher reports a change
-        private PowerSettingsWatcher _freqWatcher;
+        private const int FreqReactMs = 30, FreqReactSlowMs = 200; // see ReactMs
+        private PowerSettingsWatcher _freqWatcher;  // shared by the frequency caps and EPP
+
+        // Energy performance preference per mode x power source (separate instance: turning one feature off does not
+        // put back the other's values).
+        private readonly FreqLimiter _epp = new FreqLimiter();
+        private static readonly Guid[] EppSettings = { PowerPlan.Epp1, PowerPlan.Epp0 };
+        private int[] _eppLast;
+        private long _eppCheckedAt = long.MinValue / 2;
+        private readonly List<long> _eppCorrections = new List<long>();
+        private string _eppError;
+        // App-launch boost: after a newly started program comes to the foreground, Lenovo's process management service
+        // raises the caps (and PL may be raised) for a while; with boost allowed they are left alone until the window ends
+        // (it also rewrites the caps after every load change, so "until it stops writing" would never end).
+        private const int LaunchBoostMs = 10000, LaunchBoostMaxMs = 30000;
+        private long _launchStart, _launchUntil = long.MinValue / 2;
+        private int _lastForegroundPid;
+        private bool _freqHeld;
+        private bool _multiLoad;
+        private long _powerWroteAt = long.MinValue / 2; // last time we applied power settings (caps / EPP)
+        private volatile bool _fastTicks;
+        private long _fullTickAt = long.MinValue / 2;
+        private readonly double[] _loadHistory = new double[4]; // last busy-core samples, newest at _loadNext - 1
+        private int _loadNext, _loadSamples;
 
         public event Action<Reading> Updated;
 
@@ -117,7 +147,7 @@ namespace ThinkBookFanControl
         {
             lock (_written) { for (int i = 0; i < _written.Length; i++) { _written[i] = int.MinValue; _ramp[i] = double.NaN; } }
             _plTriedAt = long.MinValue / 2;
-            _freqForce = true;
+            _freqForce = _eppForce = true;
             _resumed = true;
             _wake.Set();
         }
@@ -136,6 +166,7 @@ namespace ThinkBookFanControl
                 _backend.RestoreAuto();
                 if (_plOriginal != null) { try { _cpu.RestoreLimits(_plOriginal); } catch (Exception) { } _plOriginal = null; }
                 try { _freq.Restore(); } catch (Exception) { }
+                try { _epp.Restore(); } catch (Exception) { }
                 if (_freqWatcher != null) { _freqWatcher.Dispose(); _freqWatcher = null; }
                 if (_hwinfo != null) { _hwinfo.Dispose(); _hwinfo = null; }
                 _cpu.Dispose();
@@ -148,7 +179,20 @@ namespace ThinkBookFanControl
         {
             while (_running)
             {
-                try { lock (_hw) { if (!_stopped) Tick(); } }
+                try
+                {
+                    lock (_hw)
+                    {
+                        if (!_stopped)
+                        {
+                            // Woken by a rewritten power setting between regular ticks: put the caps / EPP back at once,
+                            // without the 50–100 ms of sensor reads a full tick takes (EPP stayed 0.1–0.2 s that way).
+                            long now = _clock.ElapsedMilliseconds;
+                            if ((_freqForce || _eppForce) && now - _fullTickAt < TickMs - 30) Reassert(now);
+                            else { _fullTickAt = now; Tick(); }
+                        }
+                    }
+                }
                 catch (Exception ex)
                 {
                     var r = new Reading { Temp = -1, Rpm = new int[_fans.Count], Target = new int[_fans.Count], Desired = new int[_fans.Count], Error = ex.Message };
@@ -156,8 +200,28 @@ namespace ThinkBookFanControl
                     r.CurveTemp = r.CpuMhz = r.CpuUsage = r.CpuPowerW = r.Pl1W = r.Pl2W = r.Pl1TauS = r.MmioPl1W = r.MmioPl2W = double.NaN;
                     Raise(r);
                 }
-                _wake.WaitOne(1000);
+                // A reported change that came too soon is handled shortly; regular ticks keep their cadence (with
+                // all-core caps the load is sampled 4 times a second so an all-core load gets its cap within ~0.5 s).
+                _wake.WaitOne(_freqForce || _eppForce ? ReactMs : (int)Math.Max(1, TickMs - (_clock.ElapsedMilliseconds - _fullTickAt)));
             }
+        }
+
+        private int TickMs { get { return _fastTicks ? 250 : 1000; } }
+
+        /// <summary>Only the power-setting part of a tick: caps and EPP as the last full tick decided them.</summary>
+        private void Reassert(long now)
+        {
+            bool freqOn, dcTurbo, allowBoost, eppOn; int[] freqTable, freqMulti, eppTable;
+            lock (_settings)
+            {
+                freqOn = _settings.FreqLimitEnabled; freqTable = (int[])_settings.FreqMhz.Clone(); dcTurbo = _settings.DcTurbo;
+                freqMulti = (int[])_settings.FreqMultiMhz.Clone();
+                eppOn = _settings.EppEnabled; eppTable = (int[])_settings.EppPct.Clone();
+                allowBoost = _settings.AllowBoost;
+            }
+            var r = new Reading();
+            ApplyFreqLimits(r, freqOn, EffectiveCaps(freqTable, freqMulti, _multiLoad), dcTurbo, allowBoost && now < _launchUntil && !_multiLoad, now);
+            ApplyEpp(r, eppOn, eppTable, now);
         }
 
         private void Tick()
@@ -178,7 +242,7 @@ namespace ThinkBookFanControl
             _cpu.Sample(r);
 
             // ---- snapshot settings
-            FanMode mode; int[] fixedRpm, freqTable; List<CurvePoint>[] curves; bool linkFixed, linkCurves, allowLow, rampOn, plOn, hwinfo, freqOn, dcTurbo;
+            FanMode mode; int[] fixedRpm, freqTable, freqMulti, eppTable; List<CurvePoint>[] curves; bool linkFixed, linkCurves, allowLow, rampOn, plOn, hwinfo, freqOn, dcTurbo, allowBoost, eppOn;
             int hyst, smooth, critical, lowMaxTemp, rampUp, rampDown, pl1, pl2, tau;
             lock (_settings)
             {
@@ -193,6 +257,9 @@ namespace ThinkBookFanControl
                 plOn = _settings.PowerLimitEnabled; pl1 = _settings.Pl1W; pl2 = _settings.Pl2W; tau = _settings.Pl1TauS;
                 hwinfo = _settings.HwInfoEnabled;
                 freqOn = _settings.FreqLimitEnabled; freqTable = (int[])_settings.FreqMhz.Clone(); dcTurbo = _settings.DcTurbo;
+                freqMulti = (int[])_settings.FreqMultiMhz.Clone();
+                eppOn = _settings.EppEnabled; eppTable = (int[])_settings.EppPct.Clone();
+                allowBoost = _settings.AllowBoost;
             }
             if (!_backend.CanSetSpeed && mode != FanMode.Max) mode = FanMode.Auto; // only auto / full speed
 
@@ -205,8 +272,11 @@ namespace ThinkBookFanControl
                     _tempWindow.Enqueue(r.Temp);
                 }
                 while (_tempWindow.Count > smooth) _tempWindow.Dequeue();
-                double avg = 0; foreach (int t in _tempWindow) avg += t; avg /= _tempWindow.Count;
-                _curveTemp = double.IsNaN(_curveTemp) ? avg : Math.Max(avg, Math.Min(_curveTemp, avg + hyst));
+                if (_tempWindow.Count > 0)
+                {
+                    double avg = 0; foreach (int t in _tempWindow) avg += t; avg /= _tempWindow.Count;
+                    _curveTemp = double.IsNaN(_curveTemp) ? avg : Math.Max(avg, Math.Min(_curveTemp, avg + hyst));
+                }
 
                 if (r.Temp >= critical) _failsafe = true;
                 else if (r.Temp < critical - FailsafeReleaseC) _failsafe = false;
@@ -283,8 +353,15 @@ namespace ThinkBookFanControl
                 }
             }
 
-            if (!_stopped) ApplyPowerLimits(r, plOn, pl1, pl2, tau, now);
-            if (!_stopped) ApplyFreqLimits(r, freqOn, freqTable, dcTurbo, now);
+            DetectLaunch(now);
+            bool boosting = allowBoost && now < _launchUntil && !_multiLoad; // never under all-core load
+            r.BoostSecondsLeft = boosting ? (int)Math.Ceiling((_launchUntil - now) / 1000.0) : 0;
+            if (!_stopped) ApplyPowerLimits(r, plOn, pl1, pl2, tau, boosting, now);
+            UpdateLoadState(r, now);
+            _fastTicks = freqOn && Array.Exists(freqMulti, m => m > 0);
+            WatchPowerSettings(freqOn || eppOn);
+            if (!_stopped) ApplyFreqLimits(r, freqOn, EffectiveCaps(freqTable, freqMulti, r.MultiCoreLoad), dcTurbo, boosting, now);
+            if (!_stopped) ApplyEpp(r, eppOn, eppTable, now);
             Publish(r, hwinfo);
             Raise(r);
         }
@@ -293,7 +370,7 @@ namespace ThinkBookFanControl
         /// Keep our PL1 / PL2 in effect while enabled (the BIOS, Intel DTT or Lenovo's mode switch may change them),
         /// and put the original values back when disabled. Nothing is written before the original values are saved.
         /// </summary>
-        private void ApplyPowerLimits(Reading r, bool on, int pl1, int pl2, int tau, long now)
+        private void ApplyPowerLimits(Reading r, bool on, int pl1, int pl2, int tau, bool boosting, long now)
         {
             bool retry = now - _plTriedAt >= PowerLimitRetryMs;
             if (on && _cpu.CanWriteLimits)
@@ -304,6 +381,10 @@ namespace ThinkBookFanControl
                 double tauWanted = tau > 0 ? _cpu.QuantizeTau(tau) : double.NaN; // NaN: leave Tau alone
                 bool matches = LimitsMatch(r.Pl1W, r.Pl2W, r.Pl1TauS, pl1, pl2, tauWanted);
                 bool changed = pl1 != _plTriedPl1 || pl2 != _plTriedPl2 || tau != _plTriedTau;
+                bool raised = r.Pl1W > pl1 + 0.5 || r.Pl2W > pl2 + 0.5;
+                if (!matches && !changed && raised && boosting) { r.PowerBoosting = true; retry = false; } // launch boost: leave it
+                else if (_plWasBoosting && !matches) retry = true; // window over: put ours back now
+                _plWasBoosting = r.PowerBoosting;
                 if (!matches && (changed || retry))
                 {
                     _plTriedPl1 = pl1; _plTriedPl2 = pl2; _plTriedTau = tau; _plTriedAt = now;
@@ -339,7 +420,7 @@ namespace ThinkBookFanControl
         /// and power mode). Checked every few seconds: anything changed back by someone else is written again and
         /// counted, so the UI can point at Lenovo's process management service when it keeps fighting.
         /// </summary>
-        private void ApplyFreqLimits(Reading r, bool on, int[] table, bool dcTurbo, long now)
+        private void ApplyFreqLimits(Reading r, bool on, int[] table, bool dcTurbo, bool boosting, long now)
         {
             try
             {
@@ -347,29 +428,41 @@ namespace ThinkBookFanControl
                 r.OnAc = PowerPlan.OnAc;
                 Guid scheme = PowerPlan.SchemeOf(r.Mode, PowerPlan.ActiveScheme);
                 r.FreqP = (int)PowerPlan.Read(scheme, PowerPlan.FreqMaxClass1, r.OnAc);
-                r.FreqE = (int)PowerPlan.Read(scheme, PowerPlan.FreqMaxClass0, r.OnAc);
                 r.TurboOff = PowerPlan.Read(scheme, PowerPlan.BoostMode, r.OnAc) == 0;
             }
             catch (Exception) { }
 
+            if (!on) _freqForce = false; // nothing to re-check (EPP may still be watching)
             if (on)
             {
                 bool changed = _freqLast == null || !SameTable(table, _freqLast) || dcTurbo != _freqLastTurbo;
-                if (_freqWatcher == null)
-                {
-                    // React to other programs' writes at once (Intel IPF rewrites the caps every second for a while
-                    // after each app launch); the 5 s check stays as a fallback.
-                    try { _freqWatcher = new PowerSettingsWatcher(); _freqWatcher.Changed += () => { _freqForce = true; _wake.Set(); }; }
-                    catch (Exception) { }
-                }
-                if (changed || (_freqForce && now - _freqCheckedAt >= FreqReactMs) || now - _freqCheckedAt >= FreqCheckMs)
+                if (changed || (_freqForce && now - _freqCheckedAt >= ReactMs) || now - _freqCheckedAt >= FreqCheckMs || _freqHeld)
                 {
                     _freqCheckedAt = now; _freqForce = false;
                     try
                     {
                         if (_freqLastTurbo && !dcTurbo) _freq.Restore(PowerPlan.BoostMode);
-                        int n = _freq.Enforce(table, dcTurbo);
-                        if (n > 0 && !changed) _freqCorrections.Add(now); // somebody wrote them back
+                        bool hold = false;
+                        if (!changed && boosting)
+                        {
+                            // Inside the app-launch window: leave caps somebody raised alone (checked every tick, so
+                            // ours are back within a second after the window).
+                            bool raised;
+                            hold = _freq.Mismatch(table, dcTurbo, out raised) != null && raised;
+                        }
+                        _freqHeld = hold;
+                        if (!hold)
+                        {
+                            int n = _freq.Enforce(table, dcTurbo);
+                            if (n > 0)
+                            {
+                                _powerWroteAt = now;
+                                // Show what holds now, not the value that was just put back.
+                                try { r.FreqP = (int)PowerPlan.Read(PowerPlan.SchemeOf(r.Mode, PowerPlan.ActiveScheme), PowerPlan.FreqMaxClass1, r.OnAc); }
+                                catch (Exception) { }
+                            }
+                            if (n > 0 && !changed) _freqCorrections.Add(now); // somebody wrote them back
+                        }
                         _freqError = null;
                     }
                     catch (Exception ex) { _freqError = ex.Message; }
@@ -383,11 +476,149 @@ namespace ThinkBookFanControl
                 catch (Exception ex) { _freqError = "恢复频率设置失败：" + ex.Message; }
             }
             else if (!on) _freqLast = null;
-            if (!on && _freqWatcher != null) { _freqWatcher.Dispose(); _freqWatcher = null; }
             _freqCorrections.RemoveAll(t => now - t > 60000);
             r.FreqCorrections = _freqCorrections.Count;
             r.FreqError = _freqError;
+            r.FreqBoosting = on && _freqHeld;
         }
+
+        /// <summary>
+        /// How soon a reported power-setting write is checked after the previous check. Intel DTT writes "unlimited"
+        /// and then 5.0 GHz about 0.1 s apart; with a 200 ms minimum the second one stayed for 0.15–0.3 s, now both
+        /// are put back within ~50–100 ms. One DTT change takes 3–4 corrections (both caps and EPP), so only more than 12 within a second (somebody writes straight
+        /// back) it slows down to 200 ms so the two programs cannot end up in a busy loop.
+        /// </summary>
+        private int ReactMs
+        {
+            get
+            {
+                long now = _clock.ElapsedMilliseconds;
+                int n = _freqCorrections.FindAll(t => now - t < 1000).Count + _eppCorrections.FindAll(t => now - t < 1000).Count;
+                return n > 12 ? FreqReactSlowMs : FreqReactMs;
+            }
+        }
+
+        /// <summary>
+        /// React to other programs' power-setting writes at once (Lenovo's process management service rewrites the caps after
+        /// after each app launch, Lenovo's service rewrites caps / EPP); the 5 s checks stay as a fallback.
+        /// </summary>
+        private void WatchPowerSettings(bool needed)
+        {
+            if (needed && _freqWatcher == null)
+            {
+                try { _freqWatcher = new PowerSettingsWatcher(); _freqWatcher.Changed += () => { _freqForce = _eppForce = true; _wake.Set(); }; }
+                catch (Exception) { }
+            }
+            else if (!needed && _freqWatcher != null) { _freqWatcher.Dispose(); _freqWatcher = null; }
+        }
+
+        /// <summary>
+        /// Keep the energy performance preference (both core classes) per mode x power source, like the frequency caps:
+        /// Windows switches between the cells itself, changes by others are written back at once, and the original
+        /// values come back when the option is turned off or the app exits.
+        /// </summary>
+        private void ApplyEpp(Reading r, bool on, int[] table, long now)
+        {
+            try { r.EppNow = (int)PowerPlan.Read(PowerPlan.SchemeOf(r.Mode, PowerPlan.ActiveScheme), PowerPlan.Epp1, r.OnAc); }
+            catch (Exception) { }
+            if (!on) _eppForce = false;
+            if (on)
+            {
+                bool changed = _eppLast == null || !SameTable(table, _eppLast);
+                if (changed || (_eppForce && now - _eppCheckedAt >= ReactMs) || now - _eppCheckedAt >= FreqCheckMs)
+                {
+                    _eppCheckedAt = now; _eppForce = false;
+                    try
+                    {
+                        int n = _epp.EnforceTable(EppSettings, table);
+                        if (n > 0) _powerWroteAt = now;
+                        if (n > 0 && !changed) _eppCorrections.Add(now); // somebody wrote them back
+                        _eppError = null;
+                    }
+                    catch (Exception ex) { _eppError = ex.Message; }
+                    _eppLast = (int[])table.Clone();
+                }
+            }
+            else if (_epp.HasChanges && (_eppLast != null || now - _eppCheckedAt >= FreqCheckMs))
+            {
+                _eppLast = null; _eppCheckedAt = now;
+                try { _epp.Restore(); _eppError = null; }
+                catch (Exception ex) { _eppError = "恢复性能偏好失败：" + ex.Message; }
+            }
+            else if (!on) _eppLast = null;
+            _eppCorrections.RemoveAll(t => now - t > 60000);
+            r.EppCorrections = _eppCorrections.Count;
+            r.EppError = _eppError;
+        }
+
+        /// <summary>
+        /// Normal vs all-core load for the two sets of caps (sampled every 250 ms while all-core caps are set). The
+        /// all-core caps take over when the last two samples average MultiCoreLoad cores or more (0.25–0.5 s into an
+        /// all-core load), and the normal caps come back when the last four average SingleCoreLoad or less (about 1 s
+        /// after it ends). Anything lighter than an all-core load (single-threaded benchmarks, games) keeps the normal
+        /// caps: CPU-Z's single-thread test read 2.5 busy cores with background work, so a low threshold misfired. Samples within LoadSettleMs of applying power settings are
+        /// left out: applying a scheme wakes many processes at once (measured: a single-threaded load plus that burst
+        /// averaged over 2.5 cores for half a second after each of Lenovo's rewrites was put back).
+        /// </summary>
+        private void UpdateLoadState(Reading r, long now)
+        {
+            if (!double.IsNaN(r.BusyCores) && now - _powerWroteAt >= LoadSettleMs)
+            {
+                _loadHistory[_loadNext] = r.BusyCores;
+                _loadNext = (_loadNext + 1) % _loadHistory.Length;
+                _loadSamples = Math.Min(_loadSamples + 1, _loadHistory.Length);
+                if (!_multiLoad && RecentLoad(2) >= MultiCoreLoad) _multiLoad = true;
+                else if (_multiLoad && _loadSamples == _loadHistory.Length && RecentLoad(4) <= SingleCoreLoad) _multiLoad = false;
+            }
+            r.MultiCoreLoad = _multiLoad;
+        }
+
+        /// <summary>Average of the newest n busy-core samples (fewer while there are not that many yet).</summary>
+        private double RecentLoad(int n)
+        {
+            n = Math.Min(n, _loadSamples);
+            double sum = 0;
+            for (int i = 1; i <= n; i++) sum += _loadHistory[(_loadNext - i + _loadHistory.Length) % _loadHistory.Length];
+            return sum / n;
+        }
+
+        // Busy cores: 70 % / 50 % of the logical processors (16 busy threads read 14 cores on the 285H, its two
+        // low-power E cores stay idle).
+        public static readonly double MultiCoreLoad = Math.Max(2.5, Environment.ProcessorCount * 0.7),
+                                      SingleCoreLoad = Math.Max(2.0, Environment.ProcessorCount * 0.5);
+        private const int LoadSettleMs = 600;
+
+        /// <summary>The caps to keep now: under multi-core load the multi-core cap where set (never above the single-core one).</summary>
+        private static int[] EffectiveCaps(int[] single, int[] multi, bool multiLoad)
+        {
+            if (!multiLoad) return single;
+            var t = (int[])single.Clone();
+            for (int i = 0; i < t.Length; i++)
+                if (multi[i] > 0 && t[i] >= 0) t[i] = t[i] == 0 ? multi[i] : Math.Min(t[i], multi[i]);
+            return t;
+        }
+
+        /// <summary>A newly started program (started within 10 s) came to the foreground: open / extend the boost window.</summary>
+        private void DetectLaunch(long now)
+        {
+            uint pid;
+            GetWindowThreadProcessId(GetForegroundWindow(), out pid);
+            if (pid == 0 || (int)pid == _lastForegroundPid) return;
+            _lastForegroundPid = (int)pid;
+            try
+            {
+                using (var p = System.Diagnostics.Process.GetProcessById((int)pid))
+                    if ((DateTime.Now - p.StartTime).TotalSeconds < 10)
+                    {
+                        if (now >= _launchUntil) _launchStart = now;
+                        _launchUntil = Math.Min(now + LaunchBoostMs, _launchStart + LaunchBoostMaxMs);
+                    }
+            }
+            catch (Exception) { } // exited already / no access
+        }
+
+        [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
+        [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
 
         private static bool SameTable(int[] a, int[] b)
         {

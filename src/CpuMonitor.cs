@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.Management;
+using System.Runtime.InteropServices;
 
 namespace ThinkBookFanControl
 {
@@ -12,6 +13,7 @@ namespace ThinkBookFanControl
     {
         private PdhQuery _pdh;
         private int _perf = -1, _freq = -1, _util = -1;
+        private readonly BusyCoreMeter _busy;
         private readonly MsrPower _msr;
         private readonly WmiPowerLimits _wmi;
         private readonly string _msrError;
@@ -31,6 +33,7 @@ namespace ThinkBookFanControl
                 _pdh.Collect();
             }
             catch (Exception) { _pdh = null; }
+            try { _busy = new BusyCoreMeter(); } catch (Exception) { }
 
             try
             {
@@ -59,6 +62,9 @@ namespace ThinkBookFanControl
             }
         }
 
+        /// <summary>Highest turbo frequency in MHz (MSR 0x1AD through PawnIO), 0 when unknown.</summary>
+        public int MaxTurboMhz { get { return _msr != null ? _msr.MaxTurboMhz : 0; } }
+
         public int MinLimitW { get { return _wmi != null ? _wmi.MinW : 5; } }
         public int MaxLimitW { get { return _wmi != null ? _wmi.MaxW : 250; } }
 
@@ -78,6 +84,7 @@ namespace ThinkBookFanControl
                 r.CpuMhz = perf * freq / 100;
                 r.CpuUsage = double.IsNaN(util) ? util : Math.Max(0, Math.Min(100, util));
             }
+            if (_busy != null) r.BusyCores = _busy.Sample();
             if (_msr != null)
             {
                 try { r.CpuPowerW = _msr.PackagePower(); } catch (Exception) { }
@@ -157,6 +164,82 @@ namespace ThinkBookFanControl
     }
 
     /// <summary>
+    /// Busy cores from the idle threads' cycle counts (QueryIdleProcessorCycleTime, TSC cycles): a logical processor's
+    /// busy share is 1 - idle cycles / TSC cycles, and the shares are added up, so a thread that the scheduler moves
+    /// between cores still counts as about one. Measured on the ThinkBook 14+ 2025, the tick-based times (% Processor
+    /// Time, GetSystemTimes, GetThreadTimes) see one fully busy thread as 0–0.2 cores and two to four as almost nothing
+    /// (only all cores busy shows correctly); the cycle counts are right. Shares under NoiseFloor are dropped (the rest
+    /// scaled up) so background work spread thinly over many processors does not add up to a core.
+    /// </summary>
+    internal sealed class BusyCoreMeter
+    {
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool QueryIdleProcessorCycleTime(ref uint bufferLength, [Out] ulong[] idleCycles);
+        [DllImport("kernel32.dll")]
+        private static extern bool QueryThreadCycleTime(IntPtr thread, out ulong cycles);
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GetCurrentThread();
+
+        private const double NoiseFloor = 0.15;
+        private ulong[] _last, _now;
+        private long _lastTicks;
+        private double _tscHz;
+
+        public BusyCoreMeter()
+        {
+            uint size = 0;
+            QueryIdleProcessorCycleTime(ref size, null); // fails, but reports the size needed
+            if (size == 0) size = (uint)(Environment.ProcessorCount * 8);
+            _last = new ulong[size / 8];
+            _now = new ulong[_last.Length];
+            _tscHz = CalibrateTsc();
+            if (!Read(_last)) throw new InvalidOperationException("QueryIdleProcessorCycleTime");
+            _lastTicks = Stopwatch.GetTimestamp();
+        }
+
+        /// <summary>Busy cores since the previous call (NaN when unreadable or called again too soon).</summary>
+        public double Sample()
+        {
+            long ticks = Stopwatch.GetTimestamp();
+            double secs = (ticks - _lastTicks) / (double)Stopwatch.Frequency;
+            if (secs < 0.05 || !Read(_now)) return double.NaN;
+            // An idle processor cannot count more cycles than the TSC: corrects a calibration that came out low.
+            for (int i = 0; i < _now.Length; i++) _tscHz = Math.Max(_tscHz, (_now[i] - _last[i]) / secs);
+            double sum = 0;
+            for (int i = 0; i < _now.Length; i++)
+            {
+                double busy = 1 - (_now[i] - _last[i]) / (secs * _tscHz);
+                if (busy > NoiseFloor) sum += (Math.Min(1, busy) - NoiseFloor) / (1 - NoiseFloor);
+            }
+            var t = _last; _last = _now; _now = t;
+            _lastTicks = ticks;
+            return sum;
+        }
+
+        private bool Read(ulong[] a)
+        {
+            uint size = (uint)(a.Length * 8);
+            return QueryIdleProcessorCycleTime(ref size, a);
+        }
+
+        /// <summary>TSC rate: this thread's cycles while spinning 20 ms (best of three, being preempted only lowers it).</summary>
+        private static double CalibrateTsc()
+        {
+            double best = 0;
+            for (int k = 0; k < 3; k++)
+            {
+                ulong c0, c1;
+                long t0 = Stopwatch.GetTimestamp(), t1;
+                QueryThreadCycleTime(GetCurrentThread(), out c0);
+                do t1 = Stopwatch.GetTimestamp(); while (t1 - t0 < Stopwatch.Frequency / 50);
+                QueryThreadCycleTime(GetCurrentThread(), out c1);
+                best = Math.Max(best, (c1 - c0) / ((t1 - t0) / (double)Stopwatch.Frequency));
+            }
+            return best;
+        }
+    }
+
+    /// <summary>
     /// Intel RAPL through PawnIO's IntelMSR module: 0x606 units, 0x610 PKG_POWER_LIMIT (PL1 bits 14:0 + enable 15,
     /// PL1 time window "Tau" bits 23:17, PL2 bits 46:32 + enable 47, lock 63), 0x611 package energy counter. The MMIO
     /// mirror at MCHBAR + 0x59A0 is read (IntelMCHBAR module, read-only) to show it: the CPU enforces the lower of the
@@ -192,7 +275,11 @@ namespace ThinkBookFanControl
                 throw new NotSupportedException("无法读取 RAPL MSR：" + ex.Message, ex);
             }
             try { _mchbar = PawnIo.Open("IntelMCHBAR"); } catch (Exception) { _mchbar = null; }
+            try { MaxTurboMhz = (int)(Read(0x1AD) & 0xFF) * 100; } catch (Exception) { MaxTurboMhz = 0; } // 1-core turbo ratio
         }
+
+        /// <summary>Highest single-core turbo frequency (MSR 0x1AD), 0 when unknown.</summary>
+        public readonly int MaxTurboMhz;
 
         private ulong Read(uint msr) { return (ulong)_msr.Execute("ioctl_read_msr", new long[] { msr }, 1)[0]; }
 
