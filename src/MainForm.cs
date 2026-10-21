@@ -841,8 +841,8 @@ namespace ThinkBookFanControl
             sb.Append("当前：").Append(r.OnAc ? "插电" : "电池").Append(" · ").Append(PowerPlan.ModeName(r.Mode));
             if (r.FreqP >= 0) sb.Append("\nP 核 ").Append(r.FreqP == 0 ? "不限" : "≤ " + r.FreqP + " MHz").Append(" · E 核 ").Append(r.FreqE == 0 ? "不限" : "≤ " + r.FreqE + " MHz");
             if (r.TurboOff) sb.Append("\n睿频已关闭：高于基础频率的上限不起作用");
-            bool warn = r.FreqError != null || r.FreqCorrections >= 3;
-            if (r.FreqCorrections >= 3) sb.Append("\n⚠ 1 分钟内被其他程序改回 ").Append(r.FreqCorrections).Append(" 次（联想进程管理服务？可勾选上面的选项）");
+            bool warn = r.FreqError != null;
+            if (r.FreqCorrections > 0) sb.Append("\n1 分钟内被其他程序改写 ").Append(r.FreqCorrections).Append(" 次，已立即改回（主要是 Intel IPF 在打开程序时的临时加速）");
             if (r.FreqError != null) sb.Append("\n⚠ ").Append(r.FreqError);
             _freqInfo.ForeColor = warn ? Color.FromArgb(180, 83, 9) : Palette.Text;
             SetText(_freqInfo, sb.ToString());

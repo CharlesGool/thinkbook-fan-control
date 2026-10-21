@@ -69,9 +69,12 @@ ThinkBookFanControl.exe --diag report.txt
 | 平衡 | 当前电源计划 |
 | 最佳能效 / 最佳性能 | 对应的电源模式覆盖层（`961cc777…` / `ded574b5…`），覆盖层的值优先于电源计划（Windows 默认在「最佳能效 + 电池」下限制 3000 MHz） |
 
-每种情况的插电 / 电池值都写进去，切换电源模式或插拔电源时由 Windows 自己换用对应的值。程序每 5 秒检查一次，被改回就重新写入；关闭选项或退出时恢复原值。实测把 P 核限制到 2000 MHz 后，满载时 P 核频率从 2900 MHz 降到约 2000 MHz。
+每种情况的插电 / 电池值都写进去，切换电源模式或插拔电源时由 Windows 自己换用对应的值。程序监听电源设置的注册表变化，别的程序一改就立即写回（另外每 5 秒兜底检查一次）；关闭选项或退出时恢复原值。实测把 P 核限制到 2000 MHz 后，满载时 P 核频率从 2900 MHz 降到约 2000 MHz。
 
-**联想驱动会改回这些值**：联想进程管理服务（`LenovoProcessManagement` / `LNVDispatcherService`）会按场景 / 电量动态改写频率上限、EPP 和睿频，实测在 1–3 秒内就把写入的上限改回 4800 / 5000 MHz。它的注册表设置 `HKLM\SYSTEM\CurrentControlSet\Services\LenovoProcessManagement\Performance\PowerSlider\Policy_DisablePPMCtrl` 设为 `1` 并重启服务后，实测不再改回。打开频率限制时程序会询问是否这样设置（也可以单独勾选「不让联想进程管理服务调节频率」）；这是系统设置，退出程序后仍保持，取消勾选恢复原值。如果仍被改回，界面会显示「1 分钟内被其他程序改回 N 次」。
+**有两个系统组件会改这些值**（实测，逐个临时停用服务对比得出）：
+
+1. **Intel IPF**（Innovation Platform Framework，服务 `ipfsvc` / `ipf_uf.exe`，Intel DTT 的一部分）：每次打开程序后的十几秒内，每秒把当前电源计划的插电上限改成 4800 → 5000 MHz（启动加速）。停用 `ipfsvc` 后不再出现，但它负责 DTT 对 CPU 的调节，程序不去停用它，而是靠监听立即改回：实测连续打开程序时，被改写的上限约 60–80 毫秒内就恢复，96.9% 的时间保持在设定值（之前要等最多 5 秒）。打开程序时 PL1 / PL2 被临时拉高（如 80 / 140 W）应该也是同一机制，自定义 PL 的复查间隔因此缩短到 2 秒。
+2. **联想进程管理服务**：联想进程管理服务（`LenovoProcessManagement` / `LNVDispatcherService`）会按场景 / 电量动态改写频率上限、EPP 和睿频，实测在 1–3 秒内就把写入的上限改回 4800 / 5000 MHz。它的注册表设置 `HKLM\SYSTEM\CurrentControlSet\Services\LenovoProcessManagement\Performance\PowerSlider\Policy_DisablePPMCtrl` 设为 `1` 并重启服务后，实测不再改回。打开频率限制时程序会询问是否这样设置（也可以单独勾选「不让联想进程管理服务调节频率」）；这是系统设置，退出程序后仍保持，取消勾选恢复原值。如果仍被改回，界面会显示「1 分钟内被其他程序改回 N 次」。
 
 联想默认在电池下关闭睿频（`Policy_DisableDCTurbo = 1` → `PERFBOOSTMODE` 电池值 = 0），此时高于基础频率的电池上限不起作用；勾选「电池供电时也允许睿频」会把插电时的睿频模式复制到电池（取消勾选恢复）。
 

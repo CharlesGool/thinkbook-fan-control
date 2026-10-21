@@ -37,7 +37,7 @@ namespace ThinkBookFanControl
     {
         private const int FailsafeReleaseC = 5;   // leave over-temperature mode this many °C below the limit
         private const int SensorLostMs = 3000;    // hand control back to the EC after this long without a temperature
-        private const int PowerLimitRetryMs = 5000;
+        private const int PowerLimitRetryMs = 2000; // Intel DTT raises PL1 / PL2 for a while after app launches
 
         private readonly IFanBackend _backend;
         private readonly List<FanInfo> _fans;
@@ -80,6 +80,8 @@ namespace ThinkBookFanControl
         private readonly List<long> _freqCorrections = new List<long>();
         private string _freqError;
         private const int FreqCheckMs = 5000;
+        private const int FreqReactMs = 200;  // at most this often when the watcher reports a change
+        private PowerSettingsWatcher _freqWatcher;
 
         public event Action<Reading> Updated;
 
@@ -134,6 +136,7 @@ namespace ThinkBookFanControl
                 _backend.RestoreAuto();
                 if (_plOriginal != null) { try { _cpu.RestoreLimits(_plOriginal); } catch (Exception) { } _plOriginal = null; }
                 try { _freq.Restore(); } catch (Exception) { }
+                if (_freqWatcher != null) { _freqWatcher.Dispose(); _freqWatcher = null; }
                 if (_hwinfo != null) { _hwinfo.Dispose(); _hwinfo = null; }
                 _cpu.Dispose();
                 if (_ownedWmi != null) _ownedWmi.Dispose();
@@ -352,7 +355,14 @@ namespace ThinkBookFanControl
             if (on)
             {
                 bool changed = _freqLast == null || !SameTable(table, _freqLast) || dcTurbo != _freqLastTurbo;
-                if (changed || _freqForce || now - _freqCheckedAt >= FreqCheckMs)
+                if (_freqWatcher == null)
+                {
+                    // React to other programs' writes at once (Intel IPF rewrites the caps every second for a while
+                    // after each app launch); the 5 s check stays as a fallback.
+                    try { _freqWatcher = new PowerSettingsWatcher(); _freqWatcher.Changed += () => { _freqForce = true; _wake.Set(); }; }
+                    catch (Exception) { }
+                }
+                if (changed || (_freqForce && now - _freqCheckedAt >= FreqReactMs) || now - _freqCheckedAt >= FreqCheckMs)
                 {
                     _freqCheckedAt = now; _freqForce = false;
                     try
@@ -373,6 +383,7 @@ namespace ThinkBookFanControl
                 catch (Exception ex) { _freqError = "恢复频率设置失败：" + ex.Message; }
             }
             else if (!on) _freqLast = null;
+            if (!on && _freqWatcher != null) { _freqWatcher.Dispose(); _freqWatcher = null; }
             _freqCorrections.RemoveAll(t => now - t > 60000);
             r.FreqCorrections = _freqCorrections.Count;
             r.FreqError = _freqError;

@@ -198,6 +198,56 @@ namespace ThinkBookFanControl
     }
 
     /// <summary>
+    /// Signals as soon as any power setting is written (registry change under ...\Control\Power\User\PowerSchemes),
+    /// so values another program writes (Intel IPF raises the frequency caps for a few seconds after every app launch)
+    /// can be put back within milliseconds instead of at the next poll. Runs its own thread; Changed is raised there.
+    /// </summary>
+    public sealed class PowerSettingsWatcher : IDisposable
+    {
+        private const string SchemesPath = @"SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes";
+        private const int RegNotifyChangeLastSet = 4;
+        private readonly Microsoft.Win32.RegistryKey _key;
+        private readonly System.Threading.AutoResetEvent _event = new System.Threading.AutoResetEvent(false);
+        private readonly System.Threading.Thread _thread;
+        private volatile bool _stop;
+
+        public event Action Changed;
+
+        public PowerSettingsWatcher()
+        {
+            _key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(SchemesPath, false);
+            if (_key == null) throw new InvalidOperationException("找不到电源方案注册表");
+            _thread = new System.Threading.Thread(Loop) { IsBackground = true, Name = "PowerSettingsWatcher" };
+            _thread.Start();
+        }
+
+        private void Loop()
+        {
+            while (!_stop)
+            {
+                // One-shot: re-arm after every signal.
+                int err = RegNotifyChangeKeyValue(_key.Handle, true, RegNotifyChangeLastSet, _event.SafeWaitHandle, true);
+                if (err != 0) return;
+                _event.WaitOne();
+                if (_stop) return;
+                var h = Changed;
+                if (h != null) h();
+                System.Threading.Thread.Sleep(50); // the power service writes several values at once: let it finish
+            }
+        }
+
+        public void Dispose()
+        {
+            _stop = true;
+            _event.Set();
+            _key.Close();
+        }
+
+        [DllImport("advapi32.dll")]
+        private static extern int RegNotifyChangeKeyValue(Microsoft.Win32.SafeHandles.SafeRegistryHandle key, bool watchSubtree, int filter, Microsoft.Win32.SafeHandles.SafeWaitHandle ev, bool asynchronous);
+    }
+
+    /// <summary>
     /// Lenovo Process Management service (LNVDispatcherService) policy: with Policy_DisablePPMCtrl = 0 it rewrites the
     /// processor frequency caps / EPP / turbo on its own schedule (e.g. per battery level). Setting it to 1 and restarting
     /// the service stops that. It is a system setting: it stays until changed back.
