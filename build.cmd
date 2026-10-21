@@ -7,5 +7,8 @@ if not exist res\app.ico call tools\make-icon.cmd
 if not exist bin mkdir bin
 "%CSC%" /nologo /target:winexe /platform:anycpu /optimize+ /utf8output /codepage:65001 ^
   /out:bin\ThinkBookFanControl.exe /win32manifest:app.manifest /win32icon:res\app.ico /resource:res\app.ico,app.ico ^
-  /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Management.dll ^
+  /resource:res\pawnio\IntelMSR.bin,pawnio.IntelMSR.bin /resource:res\pawnio\IntelMCHBAR.bin,pawnio.IntelMCHBAR.bin ^
+  /resource:res\pawnio\LpcIO.bin,pawnio.LpcIO.bin /resource:res\pawnio\LpcACPIEC.bin,pawnio.LpcACPIEC.bin ^
+  /resource:res\pawnio\PawnIO_setup.exe,pawnio.PawnIO_setup.exe ^
+  /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Management.dll /r:System.ServiceProcess.dll ^
   src\*.cs

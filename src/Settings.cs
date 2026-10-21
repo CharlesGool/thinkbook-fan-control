@@ -18,15 +18,22 @@ namespace ThinkBookFanControl
 
     public static class Curve
     {
+        /// <summary>
+        /// The built-in curves are written in RPM for a ~5500 RPM laptop fan; fans controlled in % duty get the same
+        /// shape scaled to their range.
+        /// </summary>
+        public static double Scale(FanInfo fan, double rpm) { return fan.IsRpm ? rpm : rpm * fan.MaxRpm / 5500.0; }
+        private static int S(FanInfo fan, int rpm) { return (int)Math.Round(Scale(fan, rpm)); }
+
         public static List<CurvePoint> Default(FanInfo fan)
         {
             return new List<CurvePoint>
             {
                 new CurvePoint(40, fan.MinRpm),
-                new CurvePoint(55, Math.Max(fan.MinRpm, 2200)),
-                new CurvePoint(65, 2800),
-                new CurvePoint(75, 3600),
-                new CurvePoint(85, Math.Min(fan.MaxRpm, 4600)),
+                new CurvePoint(55, Math.Max(fan.MinRpm, S(fan, 2200))),
+                new CurvePoint(65, S(fan, 2800)),
+                new CurvePoint(75, S(fan, 3600)),
+                new CurvePoint(85, Math.Min(fan.MaxRpm, S(fan, 4600))),
                 new CurvePoint(95, fan.MaxRpm),
             };
         }
@@ -42,9 +49,9 @@ namespace ThinkBookFanControl
             {
                 new CurvePoint(45, 0),
                 new CurvePoint(50, fan.MinRpm),
-                new CurvePoint(65, Math.Max(fan.MinRpm, 2000)),
-                new CurvePoint(75, 2600),
-                new CurvePoint(85, 3600),
+                new CurvePoint(65, Math.Max(fan.MinRpm, S(fan, 2000))),
+                new CurvePoint(75, Math.Max(fan.MinRpm, S(fan, 2600))),
+                new CurvePoint(85, S(fan, 3600)),
                 new CurvePoint(92, fan.MaxRpm),
             };
         }
@@ -54,10 +61,10 @@ namespace ThinkBookFanControl
         {
             return new List<CurvePoint>
             {
-                new CurvePoint(40, Math.Max(fan.MinRpm, 2400)),
-                new CurvePoint(55, 3000),
-                new CurvePoint(65, 3800),
-                new CurvePoint(75, Math.Min(fan.MaxRpm, 4600)),
+                new CurvePoint(40, Math.Max(fan.MinRpm, S(fan, 2400))),
+                new CurvePoint(55, Math.Max(fan.MinRpm, S(fan, 3000))),
+                new CurvePoint(65, S(fan, 3800)),
+                new CurvePoint(75, Math.Min(fan.MaxRpm, S(fan, 4600))),
                 new CurvePoint(85, fan.MaxRpm),
             };
         }
@@ -135,6 +142,8 @@ namespace ThinkBookFanControl
     {
         public const string AppDirName = "ThinkBookFanControl";
         private const string OldAppDirName = "LenovoFanCurve";
+        public const int RampMin = 50, RampMax = 3000; // RPM per second
+        public const int FreqMaxMhz = 9900;
 
         public FanMode Mode = FanMode.Auto;
         public int[] FixedRpm;
@@ -147,6 +156,17 @@ namespace ThinkBookFanControl
         public bool MinimizeToTray = true;
         public bool AllowLowSpeed;          // allow 1000..min RPM and 0 = stop
         public int LowSpeedMaxTempC = 50;   // low speed / stop only below this temperature
+        public bool RampEnabled = true;     // move the written target gradually instead of jumping
+        public int RampUpRpmPerSec = 300;
+        public int RampDownRpmPerSec = 150;
+        public bool PowerLimitEnabled;      // keep our PL1 / PL2 applied (original values come back when off / on exit)
+        public int Pl1W, Pl2W;              // 0 = not chosen yet (filled from the current values)
+        public int Pl1TauS;                 // PL1 time window in seconds, 0 = leave the BIOS value
+        public bool HwInfoEnabled = true;   // publish sensors to HWiNFO's custom sensor registry keys
+        public bool FreqLimitEnabled;       // keep the P / E core frequency caps below in the Windows power settings
+        public int[] FreqMhz = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 }; // FreqLimiter.Index order, -1 = not chosen yet
+        public bool DcTurbo;                // allow turbo on battery (Lenovo turns it off)
+        public int LenovoPpmOriginal = -1;  // Policy_DisablePPMCtrl before we changed it, -1 = we did not
 
         /// <summary>The active custom curve profile; Curves / LinkCurves read and write through it.</summary>
         public CurveProfile Profile { get { return Profiles[ActiveProfile]; } }
@@ -171,7 +191,7 @@ namespace ThinkBookFanControl
         {
             var s = new Settings();
             s.FixedRpm = new int[fans.Count];
-            for (int i = 0; i < fans.Count; i++) s.FixedRpm[i] = Math.Min(fans[i].MaxRpm, Math.Max(fans[i].MinRpm, 3000));
+            for (int i = 0; i < fans.Count; i++) s.FixedRpm[i] = Clamp((int)Math.Round(Curve.Scale(fans[i], 3000)), fans[i].MinRpm, fans[i].MaxRpm);
 
             var kv = new Dictionary<string, string>();
             try
@@ -196,6 +216,26 @@ namespace ThinkBookFanControl
             s.SmoothingSec = Int(kv, "SmoothingSec", s.SmoothingSec, 1, 30);
             s.CriticalTempC = Int(kv, "CriticalTempC", s.CriticalTempC, 75, 100);
             s.LowSpeedMaxTempC = Int(kv, "LowSpeedMaxTempC", s.LowSpeedMaxTempC, 35, 70);
+            if (kv.TryGetValue("RampEnabled", out v)) s.RampEnabled = v == "1";
+            s.RampUpRpmPerSec = Int(kv, "RampUpRpmPerSec", s.RampUpRpmPerSec, RampMin, RampMax);
+            s.RampDownRpmPerSec = Int(kv, "RampDownRpmPerSec", s.RampDownRpmPerSec, RampMin, RampMax);
+            if (kv.TryGetValue("PowerLimitEnabled", out v)) s.PowerLimitEnabled = v == "1";
+            s.Pl1W = Int(kv, "Pl1W", 0, 0, 500);
+            s.Pl2W = Int(kv, "Pl2W", 0, 0, 500);
+            s.Pl1TauS = Int(kv, "Pl1TauS", 0, 0, 448);
+            if (kv.TryGetValue("HwInfoEnabled", out v)) s.HwInfoEnabled = v == "1";
+            if (kv.TryGetValue("FreqLimitEnabled", out v)) s.FreqLimitEnabled = v == "1";
+            if (kv.TryGetValue("DcTurbo", out v)) s.DcTurbo = v == "1";
+            s.LenovoPpmOriginal = Int(kv, "LenovoPpmOriginal", -1, -1, 1);
+            if (kv.TryGetValue("FreqMhz", out v))
+            {
+                var parts = v.Split(',');
+                for (int i = 0; i < parts.Length && i < s.FreqMhz.Length; i++)
+                {
+                    int n;
+                    if (int.TryParse(parts[i], NumberStyles.Integer, CultureInfo.InvariantCulture, out n)) s.FreqMhz[i] = Clamp(n, -1, FreqMaxMhz);
+                }
+            }
             for (int i = 0; i < fans.Count; i++) s.FixedRpm[i] = Int(kv, "Fixed" + fans[i].Id, s.FixedRpm[i], 0, fans[i].MaxRpm);
 
             // Profiles: Profile<n>.Name / .Link / .Curve<fanId>. Older files had a single LinkCurves + Curve<fanId>.
@@ -228,6 +268,7 @@ namespace ThinkBookFanControl
                 if (kv.TryGetValue(prefix + "Curve" + fans[i].Id, out v))
                 {
                     var c = Curve.Parse(v);
+                    for (int j = 0; j < c.Count; j++) c[j] = new CurvePoint(c[j].Temp, Clamp(c[j].Rpm, 0, fans[i].MaxRpm));
                     if (c.Count >= 2) p.Curves[i] = c;
                 }
         }
@@ -252,6 +293,18 @@ namespace ThinkBookFanControl
                 sb.AppendLine("MinimizeToTray=" + (MinimizeToTray ? 1 : 0));
                 sb.AppendLine("AllowLowSpeed=" + (AllowLowSpeed ? 1 : 0));
                 sb.AppendLine("LowSpeedMaxTempC=" + LowSpeedMaxTempC);
+                sb.AppendLine("RampEnabled=" + (RampEnabled ? 1 : 0));
+                sb.AppendLine("RampUpRpmPerSec=" + RampUpRpmPerSec);
+                sb.AppendLine("RampDownRpmPerSec=" + RampDownRpmPerSec);
+                sb.AppendLine("PowerLimitEnabled=" + (PowerLimitEnabled ? 1 : 0));
+                sb.AppendLine("Pl1W=" + Pl1W);
+                sb.AppendLine("Pl2W=" + Pl2W);
+                sb.AppendLine("Pl1TauS=" + Pl1TauS);
+                sb.AppendLine("HwInfoEnabled=" + (HwInfoEnabled ? 1 : 0));
+                sb.AppendLine("FreqLimitEnabled=" + (FreqLimitEnabled ? 1 : 0));
+                sb.AppendLine("FreqMhz=" + string.Join(",", Array.ConvertAll(FreqMhz, x => x.ToString(CultureInfo.InvariantCulture))));
+                sb.AppendLine("DcTurbo=" + (DcTurbo ? 1 : 0));
+                sb.AppendLine("LenovoPpmOriginal=" + LenovoPpmOriginal);
                 for (int i = 0; i < fans.Count; i++) sb.AppendLine("Fixed" + fans[i].Id + "=" + FixedRpm[i]);
                 sb.AppendLine("ActiveProfile=" + ActiveProfile);
                 sb.AppendLine("ProfileCount=" + Profiles.Count);
@@ -274,15 +327,15 @@ namespace ThinkBookFanControl
         public static int Clamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
         /// <summary>
-        /// Snap a user RPM to what the fan can do: 100 RPM steps within [min, max], or with low speed allowed
-        /// [LowestStableRpm, max] plus 0 = stop.
+        /// Snap a user speed to what the fan can do: Step increments within [min, max], or with low speed allowed
+        /// [LowestStable, max] plus 0 = stop.
         /// </summary>
         public static int SnapRpm(int rpm, FanInfo fan, bool allowLow)
         {
-            rpm = (int)Math.Round(rpm / 100.0) * 100;
-            if (!allowLow) return Clamp(rpm, fan.MinRpm, fan.MaxRpm);
-            if (rpm < LenovoWmi.LowestStableRpm) return 0;
-            return Clamp(rpm, LenovoWmi.LowestStableRpm, fan.MaxRpm);
+            rpm = (int)Math.Round(rpm / (double)fan.Step) * fan.Step;
+            if (!allowLow || fan.LowestStable <= 0) return Clamp(rpm, fan.MinRpm, fan.MaxRpm);
+            if (rpm < fan.LowestStable) return 0;
+            return Clamp(rpm, fan.LowestStable, fan.MaxRpm);
         }
 
         /// <summary>Raise everything below the rated minimum back to it (when low speed gets disabled).</summary>

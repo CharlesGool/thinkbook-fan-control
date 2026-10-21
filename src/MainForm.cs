@@ -22,10 +22,19 @@ namespace ThinkBookFanControl
         private readonly Settings _settings;
         private readonly FanController _controller;
         private readonly Timer _saveTimer = new Timer { Interval = 800 };
-        private bool _exiting, _loading;
+        private bool _exiting, _loading, _hwinfoHinted;
 
-        private Label _tempLabel, _statusLabel;
+        private Label _tempLabel, _statusLabel, _freqLabel, _powerLabel, _plLabel, _usageLabel;
         private Label[] _rpmLabels, _targetLabels;
+        private GroupBox _plBox;
+        private Label _plInfo;
+        private CheckBox _plOn, _hwinfo;
+        private NumericUpDown _pl1, _pl2, _tau;
+        private double _lastPl1 = double.NaN, _lastPl2 = double.NaN;
+        private CheckBox _freqOn, _dcTurbo, _lenovoPpm;
+        private NumericUpDown[] _freqNums;
+        private Label _freqInfo;
+        private Button _pawnInstall;
         // Display order and labels of the modes (radio buttons and tray menu).
         private static readonly FanMode[] ModeOrder = { FanMode.Quiet, FanMode.Auto, FanMode.Performance, FanMode.Max, FanMode.Fixed, FanMode.Curve };
         private static string ModeName(FanMode m, bool full)
@@ -52,7 +61,8 @@ namespace ThinkBookFanControl
         private NumericUpDown _lowMaxTemp;
         private Label[] _fixedLabels;
         private ComboBox _curveFan;
-        private NumericUpDown _hyst, _smooth, _critical;
+        private NumericUpDown _hyst, _smooth, _critical, _rampUp, _rampDown;
+        private CheckBox _rampOn;
         private CurveEditor _curve;
         private HistoryView _history;
         private GroupBox _fixedBox, _curveBox;
@@ -108,13 +118,23 @@ namespace ThinkBookFanControl
             root.Controls.Add(status, 0, 0);
             root.SetColumnSpan(status, 2);
             _tempLabel = Tile(status, "CPU 温度", Palette.Temp);
+            _freqLabel = Tile(status, "CPU 频率", Palette.Text);
+            _usageLabel = Tile(status, "CPU 占用", Palette.Text);
+            _powerLabel = Tile(status, "CPU 功耗", Palette.Power);
+            _plLabel = Tile(status, "PL1 / PL2", Palette.Text);
             _rpmLabels = new Label[_fans.Count];
             _targetLabels = new Label[_fans.Count];
             for (int i = 0; i < _fans.Count; i++)
             {
-                _rpmLabels[i] = Tile(status, _fans[i].Name + " 实际转速", Palette.FanColor(i));
-                _targetLabels[i] = Tile(status, _fans[i].Name + " 目标", Palette.Text);
+                // One tile per fan: measured RPM big, the target in the caption (fans without a sensor show the target big).
+                Label caption;
+                if (_fans[i].HasRpm) { _rpmLabels[i] = Tile(status, _fans[i].Name, Palette.FanColor(i), out caption); _targetLabels[i] = caption; }
+                else _targetLabels[i] = Tile(status, _fans[i].Name + " 目标", Palette.FanColor(i), out caption);
             }
+            var cpu = _controller.Cpu;
+            var tips = new ToolTip();
+            if (cpu.PowerUnavailable != null) tips.SetToolTip(_powerLabel, "无法读取：" + cpu.PowerUnavailable);
+            if (cpu.LimitSource == null) tips.SetToolTip(_plLabel, "无法读取：" + cpu.LimitsUnavailable);
             _statusLabel = new Label { AutoSize = true, ForeColor = Palette.Text, Margin = Pd(12, 14, 0, 0), MaximumSize = Sz(360, 0) };
             status.Controls.Add(_statusLabel);
 
@@ -127,6 +147,7 @@ namespace ThinkBookFanControl
             foreach (var m in ModeOrder)
             {
                 var mode = m;
+                if (!ModeSupported(mode)) continue;
                 var rb = Radio(modeFlow, ModeName(mode, true));
                 rb.CheckedChanged += (s, e) => { if (rb.Checked) SetMode(mode); };
                 _radios[mode] = rb;
@@ -147,8 +168,8 @@ namespace ThinkBookFanControl
                 _fixedLabels[i] = new Label { AutoSize = true, ForeColor = Palette.FanColor(i), Margin = Pd(3, 6, 3, 0) };
                 fixedFlow.Controls.Add(_fixedLabels[i]);
                 var row = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = Pd(0, 0, 0, 0) };
-                _tracks[i] = new TrackBar { Minimum = f.MinRpm / 100, Maximum = f.MaxRpm / 100, TickFrequency = 5, Width = S(190), SmallChange = 1, LargeChange = 5, TickStyle = TickStyle.None };
-                _fixedNums[i] = new NumericUpDown { Minimum = f.MinRpm, Maximum = f.MaxRpm, Increment = 100, Width = S(80), Margin = Pd(3, 6, 3, 3) };
+                _tracks[i] = new TrackBar { Minimum = f.MinRpm / f.Step, Maximum = f.MaxRpm / f.Step, TickFrequency = 5, Width = S(190), SmallChange = 1, LargeChange = 5, TickStyle = TickStyle.None };
+                _fixedNums[i] = new NumericUpDown { Minimum = f.MinRpm, Maximum = f.MaxRpm, Increment = f.Step, Width = S(80), Margin = Pd(3, 6, 3, 3) };
                 _tracks[i].ValueChanged += (s, e) => { if (!_loading) SetFixed(idx, RpmOfTrack(idx)); };
                 _fixedNums[i].ValueChanged += (s, e) => { if (!_loading) SetFixed(idx, (int)_fixedNums[idx].Value); };
                 row.Controls.Add(_tracks[i]); row.Controls.Add(_fixedNums[i]);
@@ -198,11 +219,92 @@ namespace ThinkBookFanControl
             _smooth = Num(Row(curveFlow, "温度平滑 (秒)"), 1, 30);
             _smooth.ValueChanged += (s, e) => { if (_loading) return; lock (_settings) _settings.SmoothingSec = (int)_smooth.Value; Changed(); };
 
+            var rampBox = Group(left, "平滑调速");
+            var rampFlow = Flow(rampBox);
+            _rampOn = Check(rampFlow, "逐步改变转速（高温保护时直接全速）");
+            _rampOn.CheckedChanged += (s, e) =>
+            {
+                if (_loading) return;
+                lock (_settings) _settings.RampEnabled = _rampOn.Checked;
+                _rampUp.Enabled = _rampDown.Enabled = _rampOn.Checked; Changed();
+            };
+            _rampUp = Num(Row(rampFlow, "升速 (RPM/秒)"), Settings.RampMin, Settings.RampMax);
+            _rampUp.Increment = 50;
+            _rampUp.ValueChanged += (s, e) => { if (_loading) return; lock (_settings) _settings.RampUpRpmPerSec = (int)_rampUp.Value; Changed(); };
+            _rampDown = Num(Row(rampFlow, "降速 (RPM/秒)"), Settings.RampMin, Settings.RampMax);
+            _rampDown.Increment = 50;
+            _rampDown.ValueChanged += (s, e) => { if (_loading) return; lock (_settings) _settings.RampDownRpmPerSec = (int)_rampDown.Value; Changed(); };
+            bool rpmFans = _fans.TrueForAll(f => f.IsRpm);
+            if (!rpmFans) tips.SetToolTip(_rampOn, "本机风扇按 % 控制：速率按 5500 RPM = 100 % 换算");
+            rampBox.Visible = _controller.Backend.CanSetSpeed;
+
+            _plBox = Group(left, "CPU 功耗限制（PL1 / PL2）");
+            var plFlow = Flow(_plBox);
+            _plInfo = new Label { AutoSize = true, MaximumSize = Sz(282, 0), Margin = Pd(3, 4, 3, 4), ForeColor = Palette.Text };
+            plFlow.Controls.Add(_plInfo);
+            _plOn = Check(plFlow, "自定义 PL1 / PL2（退出时恢复原值）");
+            _plOn.CheckedChanged += (s, e) => { if (!_loading) SetPowerLimitEnabled(_plOn.Checked); };
+            _pl1 = Num(Row(plFlow, "PL1 长时功耗 (W)"), cpu.MinLimitW, cpu.MaxLimitW);
+            _pl1.ValueChanged += (s, e) => { if (!_loading) SetPowerLimits((int)_pl1.Value, (int)_pl2.Value, true); };
+            _pl2 = Num(Row(plFlow, "PL2 短时功耗 (W)"), cpu.MinLimitW, cpu.MaxLimitW);
+            _pl2.ValueChanged += (s, e) => { if (!_loading) SetPowerLimits((int)_pl1.Value, (int)_pl2.Value, false); };
+            _tau = Num(Row(plFlow, "PL1 持续时间 Tau (秒)"), 1, 448);
+            tips.SetToolTip(_tau, "PL1 时间窗口：短时间内允许按 PL2 运行，平均功耗超过 PL1 的时间超过 Tau 后回落到 PL1。\n只能取 2^Y×(1+F/4) 形式的值，会自动取最接近的（如 28 / 32 / 56 / 64 / 96 / 128 秒）。");
+            _tau.ValueChanged += (s, e) => { if (_loading) return; lock (_settings) _settings.Pl1TauS = (int)_tau.Value; Changed(); };
+            _tau.Enabled = cpu.CanSetTau;
+            if (!cpu.CanWriteLimits)
+            {
+                _plOn.Enabled = _pl1.Enabled = _pl2.Enabled = _tau.Enabled = false;
+                _plInfo.ForeColor = Color.FromArgb(180, 83, 9);
+                _plInfo.Text = "不支持设置：" + (cpu.LimitsUnavailable ?? "本机没有可写的功耗限制接口");
+            }
+            _pawnInstall = new Button { Text = PawnIo.InstalledVersion == null ? "安装 PawnIO 驱动（程序内置 v" + PawnIoSetup.BundledVersion + "）" : "更新 PawnIO 驱动到 v" + PawnIoSetup.BundledVersion, AutoSize = true, Margin = Pd(3, 6, 3, 3) };
+            tips.SetToolTip(_pawnInstall, "实时功耗、PL1 / PL2 / Tau、旧机型的 EC 风扇控制需要 PawnIO 驱动（签名驱动，兼容内存完整性）。\n安装程序来自 pawnio.eu 官方，已内置在本程序中。");
+            _pawnInstall.Click += (s, e) => InstallPawnIo();
+            _pawnInstall.Visible = PawnIoSetup.NeedsInstall;
+            plFlow.Controls.Add(_pawnInstall);
+
+            var freqBox = Group(left, "大小核最高频率（MHz，0 = 不限制）");
+            var fqFlow = Flow(freqBox);
+            _freqOn = Check(fqFlow, "按电源模式和是否插电限制频率");
+            tips.SetToolTip(_freqOn, "写入 Windows 电源设置（P 核 = PROCFREQMAX1，E 核和低功耗 E 核 = PROCFREQMAX）：\n「平衡」写入当前电源计划，「最佳能效 / 最佳性能」写入对应的电源模式覆盖层，\nWindows 会在切换电源模式、插拔电源时自动换用对应的值。关闭此选项或退出程序时恢复原值。");
+            _freqOn.CheckedChanged += (s, e) => { if (!_loading) SetFreqEnabled(_freqOn.Checked); };
+            var grid = new TableLayoutPanel { ColumnCount = 5, RowCount = 4, AutoSize = true, Margin = Pd(0, 2, 0, 2) };
+            grid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, S(58)));
+            for (int c = 0; c < 4; c++) grid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, S(56)));
+            string[] heads = { "", "插电 P", "插电 E", "电池 P", "电池 E" };
+            for (int c = 0; c < heads.Length; c++) grid.Controls.Add(new Label { Text = heads[c], AutoSize = true, Margin = Pd(2, 2, 0, 0) }, c, 0);
+            _freqNums = new NumericUpDown[12];
+            var modes = new[] { PowerMode.Efficiency, PowerMode.Balanced, PowerMode.Performance };
+            for (int row = 0; row < modes.Length; row++)
+            {
+                grid.Controls.Add(new Label { Text = PowerPlan.ModeName(modes[row]), AutoSize = true, Margin = Pd(0, 6, 0, 0) }, 0, row + 1);
+                for (int c = 0; c < 4; c++)
+                {
+                    int idx = FreqLimiter.Index(modes[row], c >= 2, c % 2 == 1);
+                    var n = new NumericUpDown { Minimum = 0, Maximum = Settings.FreqMaxMhz, Increment = 100, Width = S(54), Margin = Pd(1, 2, 1, 2) };
+                    n.ValueChanged += (s, e) => { if (_loading) return; lock (_settings) _settings.FreqMhz[idx] = (int)n.Value; Changed(); };
+                    _freqNums[idx] = n;
+                    grid.Controls.Add(n, c + 1, row + 1);
+                }
+            }
+            fqFlow.Controls.Add(grid);
+            _dcTurbo = Check(fqFlow, "电池供电时也允许睿频");
+            tips.SetToolTip(_dcTurbo, "联想默认在电池供电时关闭睿频（PERFBOOSTMODE = 0），此时高于基础频率的上限不起作用。\n勾选后电池下使用与插电相同的睿频模式；取消勾选恢复原值。");
+            _dcTurbo.CheckedChanged += (s, e) => { if (_loading) return; lock (_settings) _settings.DcTurbo = _dcTurbo.Checked; Changed(); };
+            _lenovoPpm = Check(fqFlow, "不让联想进程管理服务调节频率");
+            tips.SetToolTip(_lenovoPpm, "联想进程管理服务（LenovoProcessManagement）会按电量 / 场景改写频率上限、EPP 和睿频。\n勾选后把它的 Policy_DisablePPMCtrl 设为 1 并重启该服务（系统设置，退出本程序后仍然保持）；\n取消勾选恢复原值。实测：设为 1 后它不再改回本程序写入的频率上限。");
+            _lenovoPpm.CheckedChanged += (s, e) => { if (!_loading) SetLenovoPpm(_lenovoPpm.Checked, true); };
+            _lenovoPpm.Visible = LenovoPpm.Get() >= 0;
+            _freqInfo = new Label { AutoSize = true, MaximumSize = Sz(282, 0), Margin = Pd(3, 4, 3, 4), ForeColor = Palette.Text };
+            fqFlow.Controls.Add(_freqInfo);
+
             var genBox = Group(left, "安全与常规");
             var genFlow = Flow(genBox);
             genFlow.Controls.Add(new Label
             {
-                Text = "本机：" + Program.ModelName + (Program.ModelVerified ? "（已验证）" : "（未验证机型，请留意温度和转速）"),
+                Text = "本机：" + Program.ModelName + (Program.ModelVerified ? "（已验证）" : "（未验证机型，请留意温度和转速）") +
+                       "\n接口：" + _controller.Backend.Name,
                 AutoSize = true, MaximumSize = Sz(280, 0), Margin = Pd(3, 4, 3, 4),
                 ForeColor = Program.ModelVerified ? Palette.Text : Color.FromArgb(180, 83, 9)
             });
@@ -212,10 +314,17 @@ namespace ThinkBookFanControl
             _allowLow.CheckedChanged += (s, e) => { if (!_loading) SetAllowLow(_allowLow.Checked); };
             _lowMaxTemp = Num(Row(genFlow, "    仅在温度低于 (°C) 时生效"), 35, 70);
             _lowMaxTemp.ValueChanged += (s, e) => { if (_loading) return; lock (_settings) _settings.LowSpeedMaxTempC = (int)_lowMaxTemp.Value; Changed(); };
+            bool lowSupported = _controller.Backend.CanSetSpeed && _fans.Exists(f => f.LowestStable > 0);
+            _allowLow.Visible = _lowMaxTemp.Parent.Visible = lowSupported;
+            if (!_controller.Backend.CanSetSpeed) _fixedBox.Visible = _curveBox.Visible = false;
             _minToTray = Check(genFlow, "关闭窗口时最小化到托盘");
             _minToTray.CheckedChanged += (s, e) => { if (_loading) return; lock (_settings) _settings.MinimizeToTray = _minToTray.Checked; Changed(); };
             _autoStart = Check(genFlow, "开机自动启动（计划任务，免 UAC）");
             _autoStart.CheckedChanged += (s, e) => { if (!_loading) SetAutoStart(_autoStart.Checked); };
+            _hwinfo = Check(genFlow, "在 HWiNFO 中显示（自定义传感器）");
+            tips.SetToolTip(_hwinfo, "写入 HKCU\\Software\\HWiNFO64\\Sensors\\Custom\\" + HwInfoSensors.DeviceName +
+                "\n在 HWiNFO 的传感器窗口里显示风扇转速 / 目标、CPU 温度 / 功耗 / PL1 / PL2 / 频率 / 占用。\nHWiNFO 只在启动时读取传感器列表：第一次打开后请重启 HWiNFO（没加载时本程序会提示）。\n传感器组在列表最下面，中文界面显示为「ThinkBook 风扇 Control」。\n取消勾选会删除这些注册表项。");
+            _hwinfo.CheckedChanged += (s, e) => { if (_loading) return; lock (_settings) _settings.HwInfoEnabled = _hwinfo.Checked; Changed(); };
             var quit = new Button { Text = "恢复自动并退出", AutoSize = true, Margin = Pd(3, 8, 3, 3) };
             quit.Click += (s, e) => ExitApp();
             genFlow.Controls.Add(quit);
@@ -235,13 +344,27 @@ namespace ThinkBookFanControl
             _history = new HistoryView { Dock = DockStyle.Fill, Margin = Pd(0, 0, 0, 0) };
             _history.Bind(_fans);
             right.Controls.Add(_history, 0, 2);
+            if (!_controller.Backend.CanSetSpeed)
+            {
+                // Only auto / full speed: no curve to edit, the history takes the whole column.
+                _curveHint.Visible = _curve.Visible = false;
+                right.RowStyles[1] = new RowStyle(SizeType.Absolute, 0);
+                right.RowStyles[2] = new RowStyle(SizeType.Percent, 100);
+            }
 
         }
 
         private Label Tile(Control parent, string caption, Color color)
         {
-            var p = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, AutoSize = true, WrapContents = false, Margin = Pd(4, 0, 18, 0) };
-            p.Controls.Add(new Label { Text = caption, AutoSize = true, ForeColor = Palette.Text, Margin = Pd(0, 0, 0, 0) });
+            Label c;
+            return Tile(parent, caption, color, out c);
+        }
+
+        private Label Tile(Control parent, string caption, Color color, out Label captionLabel)
+        {
+            var p = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, AutoSize = true, WrapContents = false, Margin = Pd(4, 0, 14, 0) };
+            captionLabel = new Label { Text = caption, AutoSize = true, ForeColor = Palette.Text, Margin = Pd(0, 0, 0, 0) };
+            p.Controls.Add(captionLabel);
             var v = new Label { Text = "--", AutoSize = true, ForeColor = color, Font = new Font(Font.FontFamily, 16f, FontStyle.Bold), Margin = Pd(0, 0, 0, 0) };
             p.Controls.Add(v);
             parent.Controls.Add(p);
@@ -279,6 +402,7 @@ namespace ThinkBookFanControl
             foreach (var m in ModeOrder)
             {
                 var mode = m;
+                if (!ModeSupported(mode)) continue;
                 var item = new ToolStripMenuItem(ModeName(mode, false), null, (s, e) => _radios[mode].Checked = true);
                 _trayModes[mode] = item;
                 menu.Items.Add(item);
@@ -298,7 +422,7 @@ namespace ThinkBookFanControl
                         _trayProfiles.DropDownItems.Add(item);
                     }
             };
-            menu.Items.Add(_trayProfiles);
+            if (_controller.Backend.CanSetSpeed) menu.Items.Add(_trayProfiles);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("恢复自动并退出", null, (s, e) => ExitApp());
             _trayIcon = FanIcon.CreateTrayIcon(SystemInformation.SmallIconSize.Width);
@@ -319,8 +443,50 @@ namespace ThinkBookFanControl
                 _linkCurves.Checked = _settings.LinkCurves;
                 _hyst.Value = _settings.HysteresisC;
                 _smooth.Value = _settings.SmoothingSec;
+                _rampOn.Checked = _settings.RampEnabled;
+                _rampUp.Value = _settings.RampUpRpmPerSec;
+                _rampDown.Value = _settings.RampDownRpmPerSec;
+                _rampUp.Enabled = _rampDown.Enabled = _settings.RampEnabled;
                 _critical.Value = _settings.CriticalTempC;
                 _minToTray.Checked = _settings.MinimizeToTray;
+                _hwinfo.Checked = _settings.HwInfoEnabled;
+                if (Array.IndexOf(_settings.FreqMhz, -1) >= 0)
+                {
+                    // Start from what Windows / Lenovo currently use, so turning the option on changes nothing yet.
+                    int[] cur = null;
+                    try { cur = FreqLimiter.ReadTable(); } catch (Exception) { }
+                    for (int i = 0; i < _settings.FreqMhz.Length; i++)
+                        if (_settings.FreqMhz[i] < 0) _settings.FreqMhz[i] = cur != null ? Math.Min(cur[i], Settings.FreqMaxMhz) : 0;
+                }
+                for (int i = 0; i < _freqNums.Length; i++) _freqNums[i].Value = Math.Max(0, Math.Min(Settings.FreqMaxMhz, _settings.FreqMhz[i]));
+                _freqOn.Checked = _settings.FreqLimitEnabled;
+                _dcTurbo.Checked = _settings.DcTurbo;
+                _lenovoPpm.Checked = LenovoPpm.Get() == 1;
+                if (_settings.Pl1W <= 0 || _settings.Pl2W <= 0)
+                {
+                    // First time: start from what the CPU currently uses (the controller thread is not running yet).
+                    // "Unlimited" BIOS values (4095.875 W) end up at the top of the range.
+                    double a, b;
+                    if (_controller.Cpu.ReadLimits(out a, out b) && a > 0)
+                    {
+                        _settings.Pl1W = (int)Math.Min(10000, Math.Round(a));
+                        _settings.Pl2W = (int)Math.Min(10000, Math.Round(b));
+                    }
+                    else { _settings.Pl1W = 45; _settings.Pl2W = 65; }
+                }
+                int pl1 = _settings.Pl1W, pl2 = _settings.Pl2W;
+                _controller.Cpu.ClampLimits(ref pl1, ref pl2);
+                _settings.Pl1W = pl1; _settings.Pl2W = pl2;
+                _pl1.Value = Math.Max(_pl1.Minimum, Math.Min(_pl1.Maximum, _settings.Pl1W));
+                _pl2.Value = Math.Max(_pl2.Minimum, Math.Min(_pl2.Maximum, _settings.Pl2W));
+                if (_settings.Pl1TauS <= 0)
+                {
+                    double a, b, t;
+                    if (_controller.Cpu.ReadLimits(out a, out b, out t) && t >= 1) _settings.Pl1TauS = (int)Math.Min(448, Math.Round(t));
+                }
+                _tau.Value = Math.Max(_tau.Minimum, Math.Min(_tau.Maximum, _settings.Pl1TauS > 0 ? _settings.Pl1TauS : 28));
+                _plOn.Checked = _settings.PowerLimitEnabled && _controller.Cpu.CanWriteLimits;
+                _copyPreset.Visible = _controller.Backend.CanSetSpeed;
                 _radios[_radios.ContainsKey(_settings.Mode) ? _settings.Mode : FanMode.Auto].Checked = true;
                 foreach (var p in _settings.Profiles) _profileBox.Items.Add(p.Name);
                 _profileBox.SelectedIndex = _settings.ActiveProfile;
@@ -498,7 +664,7 @@ namespace ThinkBookFanControl
             // Stepping up from "stop" lands on the lowest stable speed instead of snapping back to 0.
             int prev; lock (_settings) prev = _settings.FixedRpm[idx];
             int v0 = Settings.SnapRpm(rpm, _fans[idx], low);
-            if (v0 == 0 && prev == 0 && rpm > 0) v0 = LenovoWmi.LowestStableRpm;
+            if (v0 == 0 && prev == 0 && rpm > 0) v0 = _fans[idx].LowestStable;
             for (int i = 0; i < _fans.Count; i++)
             {
                 if (i != idx && !link) continue;
@@ -512,8 +678,8 @@ namespace ThinkBookFanControl
         // With low speed allowed the track's lowest tick means "stop".
         private int RpmOfTrack(int i)
         {
-            bool low; lock (_settings) low = _settings.AllowLowSpeed;
-            return low && _tracks[i].Value == _tracks[i].Minimum ? 0 : _tracks[i].Value * 100;
+            bool low; lock (_settings) low = _settings.AllowLowSpeed && _fans[i].LowestStable > 0;
+            return low && _tracks[i].Value == _tracks[i].Minimum ? 0 : _tracks[i].Value * _fans[i].Step;
         }
 
         private void RefreshFixedUi()
@@ -522,7 +688,7 @@ namespace ThinkBookFanControl
             for (int i = 0; i < _fans.Count; i++)
             {
                 int v; lock (_settings) v = _settings.FixedRpm[i];
-                _tracks[i].Value = v == 0 ? _tracks[i].Minimum : Settings.Clamp(v / 100, _tracks[i].Minimum, _tracks[i].Maximum);
+                _tracks[i].Value = v == 0 ? _tracks[i].Minimum : Settings.Clamp(v / _fans[i].Step, _tracks[i].Minimum, _tracks[i].Maximum);
                 _fixedNums[i].Value = Math.Max(_fixedNums[i].Minimum, Math.Min(_fixedNums[i].Maximum, v));
             }
             _loading = false;
@@ -535,11 +701,12 @@ namespace ThinkBookFanControl
             for (int i = 0; i < _fans.Count; i++)
             {
                 var f = _fans[i];
-                _fixedLabels[i].Text = low
-                    ? string.Format("{0}（{1}–{2} RPM，0 = 停转）", f.Name, LenovoWmi.LowestStableRpm, f.MaxRpm)
-                    : string.Format("{0}（{1}–{2} RPM）", f.Name, f.MinRpm, f.MaxRpm);
-                _tracks[i].Minimum = low ? LenovoWmi.LowestStableRpm / 100 - 1 : f.MinRpm / 100;
-                _fixedNums[i].Minimum = low ? 0 : f.MinRpm;
+                bool fanLow = low && f.LowestStable > 0;
+                _fixedLabels[i].Text = fanLow
+                    ? string.Format("{0}（{1}–{2}，0 = 停转）", f.Name, f.LowestStable, f.Format(f.MaxRpm))
+                    : string.Format("{0}（{1}–{2}）", f.Name, f.MinRpm, f.Format(f.MaxRpm));
+                _tracks[i].Minimum = fanLow ? f.LowestStable / f.Step - 1 : f.MinRpm / f.Step;
+                _fixedNums[i].Minimum = fanLow ? 0 : f.MinRpm;
             }
             _lowMaxTemp.Enabled = low;
             _curve.AllowLow = low;
@@ -551,7 +718,7 @@ namespace ThinkBookFanControl
         private void SetAllowLow(bool on)
         {
             if (on && MessageBox.Show(this,
-                    "打开后，固定转速和曲线可以设到 " + LenovoWmi.LowestStableRpm + " RPM，或设为 0 让风扇停转。\n\n" +
+                    "打开后，固定转速和曲线可以设到 " + _fans[0].Format(_fans[0].LowestStable) + "，或设为 0 让风扇停转。\n\n" +
                     "· 只有温度低于设定值时才会生效，超过后自动提回额定最低转速。\n" +
                     "· 程序被结束或崩溃时，守护进程会把风扇交还 EC 自动控制。\n\n确定要打开吗？",
                     Text, MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK)
@@ -578,21 +745,211 @@ namespace ThinkBookFanControl
         private void OnReading(Reading r)
         {
             _tempLabel.Text = r.Temp >= 0 ? r.Temp + " °C" : "--";
-            var tip = "CPU " + (r.Temp >= 0 ? r.Temp + "°C" : "--");
+            SetText(_freqLabel, double.IsNaN(r.CpuMhz) ? "--" : (r.CpuMhz / 1000).ToString("0.00") + " GHz");
+            SetText(_usageLabel, double.IsNaN(r.CpuUsage) ? "--" : r.CpuUsage.ToString("0") + " %");
+            SetText(_powerLabel, double.IsNaN(r.CpuPowerW) ? "--" : r.CpuPowerW.ToString("0.0") + " W");
+            SetText(_plLabel, double.IsNaN(r.Pl1W) ? "--" : r.Pl1W.ToString("0.#") + " / " + r.Pl2W.ToString("0.#") + " W");
+            UpdatePowerInfo(r);
+            UpdateFreqInfo(r);
+
+            var tip = "CPU " + (r.Temp >= 0 ? r.Temp + "°C" : "--") + (double.IsNaN(r.CpuPowerW) ? "" : " " + r.CpuPowerW.ToString("0") + "W");
+            var history = new int[_fans.Count];
             for (int i = 0; i < _fans.Count; i++)
             {
-                _rpmLabels[i].Text = r.Rpm[i] >= 0 ? r.Rpm[i] + " RPM" : "--";
-                _targetLabels[i].Text = r.Target[i] == 0 ? "自动" : r.Target[i] == LenovoWmi.StopValue ? "停转" : r.Target[i] + " RPM";
-                tip += " | " + (r.Rpm[i] >= 0 ? r.Rpm[i].ToString() : "--");
+                var f = _fans[i];
+                if (_rpmLabels[i] != null) _rpmLabels[i].Text = r.Rpm[i] >= 0 ? r.Rpm[i] + " RPM" : "--";
+                // While ramping show "now → heading to".
+                string target = r.Desired != null && r.Desired[i] != r.Target[i]
+                    ? TargetText(f, r.Target[i], false) + " → " + TargetText(f, r.Desired[i], true)
+                    : TargetText(f, r.Target[i], true);
+                SetText(_targetLabels[i], f.HasRpm ? f.Name + " · 目标 " + target : target);
+                history[i] = f.HasRpm ? r.Rpm[i] : r.Target[i] == FanTarget.Auto ? -1 : Math.Max(0, r.Target[i]); // EC auto: unknown, not 0 %
+                tip += " | " + (f.HasRpm ? (r.Rpm[i] >= 0 ? r.Rpm[i].ToString() : "--") : TargetText(f, r.Target[i], true));
             }
             if (r.Failsafe) { _statusLabel.ForeColor = Color.Firebrick; _statusLabel.Text = "⚠ 高温保护已触发：风扇全速，温度回落后自动恢复"; }
             else if (r.Error != null) { _statusLabel.ForeColor = Color.Firebrick; _statusLabel.Text = r.Error; }
+            else if (r.HwInfoNeedsRestart) { _statusLabel.ForeColor = Color.FromArgb(180, 83, 9); _statusLabel.Text = "HWiNFO 需要重启一次才能显示本程序的传感器"; }
             else { _statusLabel.ForeColor = Palette.Text; _statusLabel.Text = ""; }
+            if (r.HwInfoNeedsRestart && !_hwinfoHinted)
+            {
+                _hwinfoHinted = true;
+                _tray.ShowBalloonTip(10000, "HWiNFO 需要重启一次",
+                    "HWiNFO 只在启动时读取自定义传感器。重启 HWiNFO 后，传感器窗口最下面会出现「ThinkBook Fan Control」（中文界面显示为「ThinkBook 风扇 Control」）。",
+                    ToolTipIcon.Info);
+            }
+            else if (!r.HwInfoNeedsRestart) _hwinfoHinted = false;
 
-            _history.Add(r.Temp, r.Rpm);
+            _history.Add(r.Temp, history, r.CpuPowerW);
             _curve.SetLive(r.CurveTemp, r.Target);
-            tip += " RPM";
+            if (_fans.TrueForAll(f => f.HasRpm)) tip += " RPM";
             _tray.Text = tip.Length > 63 ? tip.Substring(0, 63) : tip;
+        }
+
+        private static void SetText(Label l, string s) { if (l.Text != s) l.Text = s; }
+
+        private void UpdatePowerInfo(Reading r)
+        {
+            _lastPl1 = r.Pl1W; _lastPl2 = r.Pl2W;
+            var cpu = _controller.Cpu;
+            if (cpu.LimitSource == null) return; // static "not supported" text set at build time
+            var sb = new System.Text.StringBuilder();
+            sb.Append("来源：").Append(cpu.LimitSource);
+            if (!double.IsNaN(r.Pl1W)) sb.Append("\n当前：PL1 ").Append(r.Pl1W.ToString("0.#")).Append(" W · PL2 ").Append(r.Pl2W.ToString("0.#")).Append(" W");
+            if (!double.IsNaN(r.Pl1TauS)) sb.Append(" · Tau ").Append(r.Pl1TauS.ToString(r.Pl1TauS < 10 ? "0.##" : "0")).Append(" 秒");
+            if (!double.IsNaN(r.MmioPl1W))
+                sb.Append("\nMMIO：PL1 ").Append(r.MmioPl1W.ToString("0.#")).Append(" W · PL2 ").Append(r.MmioPl2W.ToString("0.#")).Append(" W（CPU 按两者中较低的生效）");
+            if (!cpu.CanWriteLimits) sb.Append("\n不支持设置：").Append(cpu.LimitsUnavailable);
+            bool on; lock (_settings) on = _settings.PowerLimitEnabled;
+            if (on && r.PowerLimitApplied) sb.Append("\n✓ 已应用自定义值");
+            if (r.PowerLimitError != null) sb.Append("\n⚠ ").Append(r.PowerLimitError);
+            _plInfo.ForeColor = r.PowerLimitError != null || !cpu.CanWriteLimits ? Color.FromArgb(180, 83, 9) : Palette.Text;
+            SetText(_plInfo, sb.ToString());
+        }
+
+        private void SetPowerLimitEnabled(bool on)
+        {
+            if (on && MessageBox.Show(this,
+                    "打开后程序会持续把 CPU 的 PL1 / PL2 保持在设定值（BIOS、Intel DTT 或 Fn+Q 切换模式改回时会再次写入）。\n\n" +
+                    "· 关闭此选项或退出程序时恢复为接管前的数值；程序被强制结束时不会恢复（重启后由 BIOS 重新设定）。\n" +
+                    "· 功耗越高温度越高，请配合风扇曲线使用；CPU 自身的温度墙仍然有效。\n\n确定要打开吗？",
+                    Text, MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK)
+            {
+                _loading = true; _plOn.Checked = false; _loading = false;
+                return;
+            }
+            lock (_settings) _settings.PowerLimitEnabled = on;
+            Changed();
+        }
+
+        private void SetPowerLimits(int pl1, int pl2, bool pl1Changed)
+        {
+            if (pl2 < pl1)
+            {
+                // PL2 (short-term) is never below PL1 (long-term): move the other one along.
+                _loading = true;
+                if (pl1Changed) _pl2.Value = pl1; else _pl1.Value = pl2;
+                _loading = false;
+                pl1 = (int)_pl1.Value; pl2 = (int)_pl2.Value;
+            }
+            lock (_settings) { _settings.Pl1W = pl1; _settings.Pl2W = pl2; }
+            Changed();
+        }
+
+        private void UpdateFreqInfo(Reading r)
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.Append("当前：").Append(r.OnAc ? "插电" : "电池").Append(" · ").Append(PowerPlan.ModeName(r.Mode));
+            if (r.FreqP >= 0) sb.Append("\nP 核 ").Append(r.FreqP == 0 ? "不限" : "≤ " + r.FreqP + " MHz").Append(" · E 核 ").Append(r.FreqE == 0 ? "不限" : "≤ " + r.FreqE + " MHz");
+            if (r.TurboOff) sb.Append("\n睿频已关闭：高于基础频率的上限不起作用");
+            bool warn = r.FreqError != null || r.FreqCorrections >= 3;
+            if (r.FreqCorrections >= 3) sb.Append("\n⚠ 1 分钟内被其他程序改回 ").Append(r.FreqCorrections).Append(" 次（联想进程管理服务？可勾选上面的选项）");
+            if (r.FreqError != null) sb.Append("\n⚠ ").Append(r.FreqError);
+            _freqInfo.ForeColor = warn ? Color.FromArgb(180, 83, 9) : Palette.Text;
+            SetText(_freqInfo, sb.ToString());
+        }
+
+        private void SetFreqEnabled(bool on)
+        {
+            lock (_settings) _settings.FreqLimitEnabled = on;
+            Changed();
+            // Measured on the ThinkBook 14+ 2025: with its PPM control on, Lenovo's service writes its own cap back within 1–3 s.
+            if (on && LenovoPpm.Get() == 0 && MessageBox.Show(this,
+                    "联想进程管理服务（LenovoProcessManagement）会在 1–3 秒内把频率上限改回它自己的值（实测），\n" +
+                    "这里设置的上限无法保持。\n\n是否让它停止调节频率？（把 Policy_DisablePPMCtrl 设为 1 并重启该服务；\n" +
+                    "这是系统设置，退出本程序后仍然保持，取消勾选「不让联想进程管理服务调节频率」即可恢复。）",
+                    Text, MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+            {
+                _loading = true; _lenovoPpm.Checked = true; _loading = false;
+                SetLenovoPpm(true, false);
+            }
+        }
+
+        private void SetLenovoPpm(bool off, bool confirm)
+        {
+            if (off && confirm && MessageBox.Show(this,
+                    "将修改联想进程管理服务（LenovoProcessManagement）的设置 Policy_DisablePPMCtrl = 1 并重启该服务，\n" +
+                    "之后它不再按电量 / 场景改写 CPU 频率上限、EPP 和睿频。\n\n这是系统设置，退出本程序后仍然保持；取消勾选可恢复原值。\n\n确定要修改吗？",
+                    Text, MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK)
+            {
+                _loading = true; _lenovoPpm.Checked = false; _loading = false;
+                return;
+            }
+            int target;
+            lock (_settings)
+            {
+                if (off) { if (_settings.LenovoPpmOriginal < 0) _settings.LenovoPpmOriginal = Math.Max(0, LenovoPpm.Get()); target = 1; }
+                else { target = _settings.LenovoPpmOriginal == 1 ? 1 : 0; _settings.LenovoPpmOriginal = -1; }
+            }
+            Changed();
+            _lenovoPpm.Enabled = false;
+            System.Threading.ThreadPool.QueueUserWorkItem(_ =>
+            {
+                string err = null;
+                try { LenovoPpm.Set(target); } catch (Exception ex) { err = ex.Message; }
+                try
+                {
+                    BeginInvoke(new Action(() =>
+                    {
+                        _lenovoPpm.Enabled = true;
+                        _loading = true; _lenovoPpm.Checked = LenovoPpm.Get() == 1; _loading = false;
+                        if (err != null) MessageBox.Show(this, "修改联想进程管理服务失败：" + err, Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    }));
+                }
+                catch (InvalidOperationException) { }
+            });
+        }
+
+        private void InstallPawnIo()
+        {
+            if (MessageBox.Show(this,
+                    "将运行内置的 PawnIO " + PawnIoSetup.BundledVersion + " 官方安装程序（pawnio.eu，签名驱动，兼容内存完整性）。\n" +
+                    "安装后需要重新启动本程序。\n\n确定要安装吗？",
+                    Text, MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
+            _pawnInstall.Enabled = false;
+            _pawnInstall.Text = "正在安装 PawnIO……";
+            System.Threading.ThreadPool.QueueUserWorkItem(_ =>
+            {
+                string err = null; bool reboot = false;
+                try { reboot = PawnIoSetup.Install(); } catch (Exception ex) { err = ex.Message; }
+                try
+                {
+                    BeginInvoke(new Action(() =>
+                    {
+                        if (err != null)
+                        {
+                            _pawnInstall.Enabled = true;
+                            _pawnInstall.Text = "安装 PawnIO 驱动（程序内置 v" + PawnIoSetup.BundledVersion + "）";
+                            MessageBox.Show(this, "安装 PawnIO 失败：" + err, Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                            return;
+                        }
+                        _pawnInstall.Visible = false;
+                        string msg = reboot ? "PawnIO 已安装，Windows 提示需要重启电脑后才能完全生效。\n\n现在先重新启动本程序吗？" : "PawnIO 已安装。现在重新启动本程序以启用功耗读取和 PL 设置吗？";
+                        if (MessageBox.Show(this, msg, Text, MessageBoxButtons.YesNo, MessageBoxIcon.Information) == DialogResult.Yes) RestartApp();
+                    }));
+                }
+                catch (InvalidOperationException) { }
+            });
+        }
+
+        /// <summary>Start a new instance (it waits for this one to exit before taking the single-instance mutex) and exit.</summary>
+        private void RestartApp()
+        {
+            try
+            {
+                Process.Start(new ProcessStartInfo(Application.ExecutablePath, "--after " + Process.GetCurrentProcess().Id) { UseShellExecute = false });
+            }
+            catch (Exception ex) { MessageBox.Show(this, "无法重新启动：" + ex.Message, Text); return; }
+            ExitApp();
+        }
+
+        private bool ModeSupported(FanMode m) { return _controller.Backend.CanSetSpeed || m == FanMode.Auto || m == FanMode.Max; }
+
+        private string TargetText(FanInfo f, int target, bool unit)
+        {
+            if (target == FanTarget.Auto) return "自动";
+            if (target == FanTarget.Stop) return "停转";
+            if (!_controller.Backend.CanSetSpeed) return "全速";
+            return unit ? f.Format(target) : target.ToString();
         }
 
         private void OnPowerModeChanged(object sender, PowerModeChangedEventArgs e)

@@ -13,6 +13,7 @@ namespace ThinkBookFanControl
         public static readonly Color Axis = Color.FromArgb(120, 126, 138);
         public static readonly Color Text = Color.FromArgb(70, 76, 88);
         public static readonly Color Temp = Color.FromArgb(234, 88, 12);
+        public static readonly Color Power = Color.FromArgb(202, 138, 4);
         public static readonly Color[] Fan = { Color.FromArgb(37, 99, 235), Color.FromArgb(16, 163, 127), Color.FromArgb(147, 51, 234), Color.FromArgb(219, 39, 119) };
         public static Color FanColor(int i) { return Fan[i % Fan.Length]; }
 
@@ -33,9 +34,17 @@ namespace ThinkBookFanControl
         private int _drag = -1, _hover = -1;
         private double _liveTemp = double.NaN;
         private int[] _liveTarget;
-        private int _yMax = 6000;
+        private int _yMax = 6000, _yGrid = 1000;
 
         public event EventHandler CurveChanged;
+
+        /// <summary>Axis maximum and grid step for the fans' unit: 1000 RPM lines, or 20 % for duty-controlled fans.</summary>
+        public static void Axis(FanInfo[] fans, out int max, out int grid)
+        {
+            max = 0; foreach (var f in fans) max = Math.Max(max, f.MaxRpm);
+            grid = fans.Length > 0 && !fans[0].IsRpm ? 20 : 1000;
+            max = Math.Max(grid, (max + grid - 1) / grid * grid);
+        }
 
         public CurveEditor()
         {
@@ -46,8 +55,7 @@ namespace ThinkBookFanControl
         public void Bind(List<CurvePoint>[] curves, List<FanInfo> fans)
         {
             _curves = curves; _fans = fans.ToArray();
-            int max = 0; foreach (var f in fans) max = Math.Max(max, f.MaxRpm);
-            _yMax = (max + 999) / 1000 * 1000;
+            Axis(_fans, out _yMax, out _yGrid);
             Invalidate();
         }
 
@@ -83,7 +91,8 @@ namespace ThinkBookFanControl
         {
             var p = Plot;
             temp = (int)Math.Round(TempMin + (pt.X - p.Left) / (double)p.Width * (TempMax - TempMin));
-            rpm = (int)Math.Round((p.Bottom - pt.Y) / (double)p.Height * _yMax / 100.0) * 100;
+            int step = Fan.Step;
+            rpm = (int)Math.Round((p.Bottom - pt.Y) / (double)p.Height * _yMax / step) * step;
         }
 
         private int HitTest(Point pt)
@@ -170,11 +179,11 @@ namespace ThinkBookFanControl
                     g.DrawLine(gridPen, a.X, p.Top, a.X, p.Bottom);
                     g.DrawString(t + "°C", Font, txt, a.X, p.Bottom + Scale(4), sfC);
                 }
-                for (int r = 0; r <= _yMax; r += 1000)
+                for (int r = 0; r <= _yMax; r += _yGrid)
                 {
                     var a = ToScreen(TempMin, r);
                     g.DrawLine(gridPen, p.Left, a.Y, p.Right, a.Y);
-                    g.DrawString(r.ToString(), Font, txt, p.Left - Scale(4), a.Y, sfR);
+                    g.DrawString(_yGrid < 1000 ? r + "%" : r.ToString(), Font, txt, p.Left - Scale(4), a.Y, sfR);
                 }
                 g.DrawRectangle(axisPen, p);
             }
@@ -185,9 +194,9 @@ namespace ThinkBookFanControl
             {
                 var top = ToScreen(TempMin, Fan.MinRpm);
                 g.FillRectangle(band, p.Left, top.Y, p.Width, p.Bottom - top.Y);
-                if (_allowLow)
+                if (_allowLow && Fan.LowestStable > 0)
                     using (var b = new SolidBrush(Color.FromArgb(150, Palette.Text)))
-                        g.DrawString("低于额定最低转速（< " + LenovoWmi.LowestStableRpm + " 即停转）", Font, b, p.Left + Scale(6), top.Y + Scale(3));
+                        g.DrawString("低于额定最低转速（< " + Fan.Format(Fan.LowestStable) + " 即停转）", Font, b, p.Left + Scale(6), top.Y + Scale(3));
             }
 
             // Inactive curves first (dim), active last.
@@ -217,7 +226,7 @@ namespace ThinkBookFanControl
             {
                 var pt = Pts[tip];
                 var s = ToScreen(pt.Temp, pt.Rpm);
-                string label = pt.Temp + "°C → " + (pt.Rpm == 0 ? "停转" : pt.Rpm + " RPM");
+                string label = pt.Temp + "°C → " + (pt.Rpm == 0 ? "停转" : Fan.Format(pt.Rpm));
                 var sz = g.MeasureString(label, Font);
                 float bx = Math.Min(s.X + Scale(10), p.Right - sz.Width - Scale(8)), by = Math.Max(p.Top, s.Y - sz.Height - Scale(14));
                 using (var bg = new SolidBrush(Color.FromArgb(235, 30, 34, 42))) g.FillRectangle(bg, bx, by, sz.Width + Scale(8), sz.Height + Scale(4));
@@ -257,14 +266,19 @@ namespace ThinkBookFanControl
         }
     }
 
-    /// <summary>Rolling history of temperature (right axis) and fan RPM (left axis).</summary>
+    /// <summary>
+    /// Rolling history: fan RPM (or target % for fans without a speed sensor) on the left axis, CPU temperature and
+    /// package power on the right axis (°C / W share one scale; 20–100 °C when there is no power reading).
+    /// </summary>
     public class HistoryView : Control
     {
         private const int Capacity = 300; // seconds
         private readonly List<int> _temp = new List<int>();
+        private readonly List<double> _power = new List<double>();
         private readonly List<int[]> _rpm = new List<int[]>();
         private FanInfo[] _fans = new FanInfo[0];
         private int _yMax = 6000;
+        private string _unit = "RPM";
 
         public HistoryView()
         {
@@ -275,14 +289,17 @@ namespace ThinkBookFanControl
         public void Bind(List<FanInfo> fans)
         {
             _fans = fans.ToArray();
-            int max = 0; foreach (var f in fans) max = Math.Max(max, f.MaxRpm);
-            _yMax = (max + 999) / 1000 * 1000;
+            bool rpm = _fans.Length > 0 && _fans[0].HasRpm;
+            _unit = rpm ? "RPM" : "%";
+            int max = 0; foreach (var f in fans) max = Math.Max(max, rpm && !f.IsRpm ? 6000 : f.MaxRpm);
+            _yMax = rpm ? Math.Max(1000, (max + 999) / 1000 * 1000) : 100;
         }
 
-        public void Add(int temp, int[] rpm)
+        /// <summary>values: measured RPM per fan (or target % when the fan has no speed sensor), -1 = unknown.</summary>
+        public void Add(int temp, int[] values, double power)
         {
-            _temp.Add(temp); _rpm.Add((int[])rpm.Clone());
-            if (_temp.Count > Capacity) { _temp.RemoveAt(0); _rpm.RemoveAt(0); }
+            _temp.Add(temp); _rpm.Add((int[])values.Clone()); _power.Add(power);
+            if (_temp.Count > Capacity) { _temp.RemoveAt(0); _rpm.RemoveAt(0); _power.RemoveAt(0); }
             Invalidate();
         }
 
@@ -292,11 +309,19 @@ namespace ThinkBookFanControl
         {
             var g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            var p = new Rectangle(Scale(56), Scale(24), Math.Max(10, Width - Scale(56) - Scale(48)), Math.Max(10, Height - Scale(24) - Scale(22)));
+            var p = new Rectangle(Scale(56), Scale(24), Math.Max(10, Width - Scale(56) - Scale(56)), Math.Max(10, Height - Scale(24) - Scale(22)));
+
+            // Right axis: 20..100 °C, or 0..R shared by °C and W once a power reading exists.
+            double maxPower = double.NaN;
+            foreach (double w in _power) if (!double.IsNaN(w)) maxPower = double.IsNaN(maxPower) ? w : Math.Max(maxPower, w);
+            bool power = !double.IsNaN(maxPower);
+            int rLo = power ? 0 : 20, rHi = power ? Math.Max(100, (int)Math.Ceiling(maxPower / 20) * 20) : 100;
+
             using (var gridPen = new Pen(Palette.Grid))
             using (var axisPen = new Pen(Palette.Axis))
             using (var txt = new SolidBrush(Palette.Text))
             using (var tb = new SolidBrush(Palette.Temp))
+            using (var pb = new SolidBrush(Palette.Power))
             {
                 var sfR = new StringFormat { Alignment = StringAlignment.Far, LineAlignment = StringAlignment.Center };
                 var sfL = new StringFormat { Alignment = StringAlignment.Near, LineAlignment = StringAlignment.Center };
@@ -304,9 +329,10 @@ namespace ThinkBookFanControl
                 {
                     float y = p.Bottom - p.Height * i / 4f;
                     g.DrawLine(gridPen, p.Left, y, p.Right, y);
-                    g.DrawString((_yMax * i / 4).ToString(), Font, txt, p.Left - Scale(4), y, sfR);
-                    g.DrawString((20 + 80 * i / 4) + "°C", Font, tb, p.Right + Scale(4), y, sfL);
+                    g.DrawString((_yMax * i / 4) + (_unit == "%" ? "%" : ""), Font, txt, p.Left - Scale(4), y, sfR);
+                    g.DrawString((rLo + (rHi - rLo) * i / 4) + (power ? "" : "°C"), Font, tb, p.Right + Scale(4), y, sfL);
                 }
+                if (power) g.DrawString("°C / W", Font, tb, p.Right + Scale(4), Scale(1));
                 g.DrawRectangle(axisPen, p);
                 g.DrawString("最近 5 分钟", Font, txt, p.Left, p.Bottom + Scale(3));
 
@@ -314,12 +340,19 @@ namespace ThinkBookFanControl
                 float lx = p.Left;
                 for (int i = 0; i < _fans.Length; i++)
                 {
+                    string name = _fans[i].Name + (_fans[i].HasRpm ? " RPM" : " 目标 %");
                     using (var b = new SolidBrush(Palette.FanColor(i))) g.FillRectangle(b, lx, Scale(8), Scale(12), Scale(3));
-                    g.DrawString(_fans[i].Name + " RPM", Font, txt, lx + Scale(16), Scale(1));
-                    lx += Scale(16) + g.MeasureString(_fans[i].Name + " RPM", Font).Width + Scale(12);
+                    g.DrawString(name, Font, txt, lx + Scale(16), Scale(1));
+                    lx += Scale(16) + g.MeasureString(name, Font).Width + Scale(12);
                 }
                 g.FillRectangle(tb, lx, Scale(8), Scale(12), Scale(3));
                 g.DrawString("CPU 温度", Font, txt, lx + Scale(16), Scale(1));
+                lx += Scale(16) + g.MeasureString("CPU 温度", Font).Width + Scale(12);
+                if (power)
+                {
+                    g.FillRectangle(pb, lx, Scale(8), Scale(12), Scale(3));
+                    g.DrawString("CPU 功耗", Font, txt, lx + Scale(16), Scale(1));
+                }
             }
             if (_temp.Count < 2) return;
 
@@ -332,9 +365,17 @@ namespace ThinkBookFanControl
                     if (_rpm[i][f] >= 0) pts.Add(new PointF(x0 + i * dx, p.Bottom - Math.Min(_rpm[i][f], _yMax) / (float)_yMax * p.Height));
                 if (pts.Count > 1) using (var pen = new Pen(Palette.FanColor(f), Scale(2))) g.DrawLines(pen, pts.ToArray());
             }
+            Func<double, float> right = v => p.Bottom - (float)(Math.Max(0, Math.Min(rHi - rLo, v - rLo)) / (rHi - rLo)) * p.Height;
+            if (power)
+            {
+                var pp = new List<PointF>();
+                for (int i = 0; i < _power.Count; i++)
+                    if (!double.IsNaN(_power[i])) pp.Add(new PointF(x0 + i * dx, right(_power[i])));
+                if (pp.Count > 1) using (var pen = new Pen(Palette.Power, Scale(1)) { DashStyle = DashStyle.Solid }) g.DrawLines(pen, pp.ToArray());
+            }
             var tp = new List<PointF>();
             for (int i = 0; i < _temp.Count; i++)
-                if (_temp[i] >= 0) tp.Add(new PointF(x0 + i * dx, p.Bottom - Settings.Clamp(_temp[i] - 20, 0, 80) / 80f * p.Height));
+                if (_temp[i] >= 0) tp.Add(new PointF(x0 + i * dx, right(_temp[i])));
             if (tp.Count > 1) using (var pen = new Pen(Palette.Temp, Scale(2))) g.DrawLines(pen, tp.ToArray());
         }
     }

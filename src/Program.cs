@@ -10,9 +10,9 @@ namespace ThinkBookFanControl
     {
         public static Icon AppIcon;
         public static string ModelName = "未知机型";
+        public static string Family = "";
         public static bool ModelVerified;
-        private static LenovoWmi _wmi;
-        private static List<FanInfo> _fans;
+        private static IFanBackend _backend;
 
         // SystemFamily prefixes of machines this has been tested on: ThinkBook 14+ 2025.
         private static readonly string[] VerifiedFamilies = { "ThinkBook 14 G7+" };
@@ -21,6 +21,14 @@ namespace ThinkBookFanControl
         public static int Main(string[] args)
         {
             if (args.Length == 2 && args[0] == "--watchdog") return Watchdog(args[1]);
+            if (args.Length == 2 && args[0] == "--diag") return Diagnose(args[1]);
+            int after = Array.IndexOf(args, "--after"), oldPid;
+            if (after >= 0 && after + 1 < args.Length && int.TryParse(args[after + 1], out oldPid))
+            {
+                // Restarted by the previous instance (e.g. after installing PawnIO): let it exit first.
+                try { using (var old = System.Diagnostics.Process.GetProcessById(oldPid)) old.WaitForExit(15000); }
+                catch (ArgumentException) { }
+            }
 
             bool created;
             using (var mutex = new Mutex(true, "ThinkBookFanControlMutex", out created))
@@ -41,26 +49,37 @@ namespace ThinkBookFanControl
 
                 try
                 {
-                    _wmi = new LenovoWmi();
-                    _wmi.ReadCpuTemp();
-                    _fans = LenovoWmi.DiscoverFans(_wmi);
-                    if (_fans.Count == 0) throw new NotSupportedException("没有找到可控制的风扇。");
+                    string notes;
+                    _backend = FanBackends.Open(Family, out notes);
                 }
                 catch (Exception ex)
                 {
-                    MessageBox.Show("无法访问联想 BIOS WMI 风扇接口：\n\n" + ex.Message +
-                        "\n\n请确认以管理员身份运行，且本机支持 LENOVO_OTHER_METHOD（root\\WMI）。\n本机：" + ModelName, MainForm.AppName, MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    if (EcBackend.IsKnownModel(Family) && PawnIoSetup.NeedsInstall &&
+                        MessageBox.Show("本机型（" + ModelName + "）需要 PawnIO 驱动才能控制风扇。\n\n现在安装程序内置的 PawnIO " + PawnIoSetup.BundledVersion +
+                            "（pawnio.eu 官方签名驱动）吗？", MainForm.AppName, MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+                    {
+                        try
+                        {
+                            PawnIoSetup.Install();
+                            System.Diagnostics.Process.Start(Application.ExecutablePath, "--after " + System.Diagnostics.Process.GetCurrentProcess().Id);
+                            return 0;
+                        }
+                        catch (Exception ix) { MessageBox.Show("安装 PawnIO 失败：" + ix.Message, MainForm.AppName, MessageBoxButtons.OK, MessageBoxIcon.Error); return 1; }
+                    }
+                    MessageBox.Show("没有找到可用的风扇控制接口：\n\n" + ex.Message +
+                        "\n\n请确认以管理员身份运行。\n本机：" + ModelName, MainForm.AppName, MessageBoxButtons.OK, MessageBoxIcon.Error);
                     return 1;
                 }
 
                 StartWatchdog();
-                var settings = Settings.Load(_fans);
-                var controller = new FanController(_wmi, _fans, settings);
+                var fans = _backend.Fans;
+                var settings = Settings.Load(fans);
+                var controller = new FanController(_backend, settings);
                 bool minimized = Array.IndexOf(args, "--minimized") >= 0;
-                var form = new MainForm(_fans, settings, controller, minimized);
+                var form = new MainForm(fans, settings, controller, minimized);
                 controller.Start();
                 Application.Run(form);
-                _wmi.Dispose();
+                _backend.Dispose();
                 return 0;
             }
         }
@@ -78,9 +97,75 @@ namespace ThinkBookFanControl
                 using (var parent = System.Diagnostics.Process.GetProcessById(pid)) parent.WaitForExit();
             }
             catch (ArgumentException) { } // already gone
-            using (var wmi = new LenovoWmi())
-                FanController.RestoreAuto(wmi, LenovoWmi.DiscoverFans(wmi));
+            DetectModel();
+            try
+            {
+                string notes;
+                using (var backend = FanBackends.Open(Family, out notes)) backend.RestoreAuto();
+            }
+            catch (Exception) { return 1; } // nothing to restore through
             return 0;
+        }
+
+        /// <summary>
+        /// Read-only report of what this machine supports (for compatibility feedback): `--diag report.txt`.
+        /// Opens the backend and samples sensors twice; never writes a fan target or power limit.
+        /// </summary>
+        private static int Diagnose(string path)
+        {
+            var sb = new System.Text.StringBuilder();
+            DetectModel();
+            sb.AppendLine(MainForm.AppName + " 诊断信息  " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+            sb.AppendLine("机型：" + ModelName + "（SystemFamily = " + Family + "）");
+            sb.AppendLine("PawnIO：" + (PawnIo.InstalledVersion ?? "未安装"));
+            IFanBackend backend = null;
+            try
+            {
+                string notes;
+                backend = FanBackends.Open(Family, out notes);
+                sb.AppendLine("风扇接口：" + backend.Name);
+                if (notes.Length > 0) sb.AppendLine("  跳过：" + notes.Replace("\n", "\n        "));
+                try { sb.AppendLine("  CPU 温度：" + backend.ReadCpuTemp() + " °C"); } catch (Exception ex) { sb.AppendLine("  CPU 温度：读取失败 " + ex.Message); }
+                foreach (var f in backend.Fans)
+                {
+                    string rpm;
+                    try { int v = backend.ReadFanRpm(f); rpm = v >= 0 ? v + " RPM" : "无转速传感器"; } catch (Exception ex) { rpm = "读取失败 " + ex.Message; }
+                    sb.AppendLine(string.Format("  {0}（ID {1}）：范围 {2}–{3}，步进 {4}，最低稳定 {5}；当前 {6}",
+                        f.Name, f.Id, f.MinRpm, f.Format(f.MaxRpm), f.Step, f.LowestStable, rpm));
+                }
+            }
+            catch (Exception ex) { sb.AppendLine("风扇接口：无可用接口\n  " + ex.Message.Replace("\n", "\n  ")); }
+
+            var wmi = backend as LenovoWmi;
+            LenovoWmi raw = wmi == null ? LenovoWmi.OpenRaw() : null;
+            using (var cpu = new CpuMonitor(wmi ?? raw))
+            {
+                var r = new Reading { Rpm = new int[0], Target = new int[0] };
+                cpu.Sample(r);
+                Thread.Sleep(1100);
+                cpu.Sample(r);
+                sb.AppendLine(string.Format("CPU：频率 {0:0} MHz，占用 {1:0.0} %，封装功耗 {2:0.0} W", r.CpuMhz, r.CpuUsage, r.CpuPowerW));
+                if (cpu.PowerUnavailable != null) sb.AppendLine("  功耗读取不可用：" + cpu.PowerUnavailable);
+                sb.AppendLine(string.Format("  PL1 / PL2：{0:0.#} / {1:0.#} W（来源：{2}）", r.Pl1W, r.Pl2W, cpu.LimitSource ?? "无"));
+                if (!double.IsNaN(r.MmioPl1W)) sb.AppendLine(string.Format("  MMIO PL1 / PL2：{0:0.#} / {1:0.#} W", r.MmioPl1W, r.MmioPl2W));
+                sb.AppendLine("  可设置 PL1 / PL2：" + (cpu.CanWriteLimits ? "是" : "否（" + cpu.LimitsUnavailable + "）"));
+                if (!double.IsNaN(r.Pl1TauS)) sb.AppendLine(string.Format("  PL1 Tau：{0:0.###} 秒（可设置：{1}）", r.Pl1TauS, cpu.CanSetTau ? "是" : "否"));
+            }
+            try
+            {
+                sb.AppendLine("电源：" + (PowerPlan.OnAc ? "插电" : "电池") + " · 电源模式 " + PowerPlan.ModeName(PowerPlan.CurrentMode) + " · 电源计划 " + PowerPlan.ActiveScheme);
+                var t = FreqLimiter.ReadTable();
+                foreach (PowerMode m in new[] { PowerMode.Efficiency, PowerMode.Balanced, PowerMode.Performance })
+                    sb.AppendLine(string.Format("  {0}：插电 P {1} / E {2} MHz，电池 P {3} / E {4} MHz（0 = 不限）", PowerPlan.ModeName(m),
+                        t[FreqLimiter.Index(m, false, false)], t[FreqLimiter.Index(m, false, true)], t[FreqLimiter.Index(m, true, false)], t[FreqLimiter.Index(m, true, true)]));
+                int ppm = LenovoPpm.Get();
+                sb.AppendLine("  联想进程管理服务 Policy_DisablePPMCtrl：" + (ppm < 0 ? "无此服务" : ppm.ToString()));
+            }
+            catch (Exception ex) { sb.AppendLine("电源设置读取失败：" + ex.Message); }
+            if (raw != null) raw.Dispose();
+            if (backend != null) backend.Dispose();
+            try { System.IO.File.WriteAllText(path, sb.ToString(), new System.Text.UTF8Encoding(true)); return 0; }
+            catch (Exception) { return 1; }
         }
 
         private static void StartWatchdog()
@@ -110,7 +195,7 @@ namespace ThinkBookFanControl
                 using (var searcher = new System.Management.ManagementObjectSearcher("SELECT Manufacturer, SystemFamily, Model FROM Win32_ComputerSystem"))
                     foreach (System.Management.ManagementObject o in searcher.Get())
                     {
-                        string family = Convert.ToString(o["SystemFamily"]).Trim();
+                        string family = Family = Convert.ToString(o["SystemFamily"]).Trim();
                         string model = Convert.ToString(o["Model"]).Trim();
                         ModelName = family.Length > 0 ? family + (model.Length > 0 ? " (" + model + ")" : "") : model;
                         foreach (var v in VerifiedFamilies)
@@ -123,7 +208,7 @@ namespace ThinkBookFanControl
 
         private static void Crash(Exception ex)
         {
-            if (_wmi != null && _fans != null) FanController.RestoreAuto(_wmi, _fans);
+            if (_backend != null) _backend.RestoreAuto();
             MessageBox.Show("程序发生错误，风扇已交还 EC 自动控制。\n\n" + (ex != null ? ex.ToString() : ""), MainForm.AppName, MessageBoxButtons.OK, MessageBoxIcon.Error);
             Environment.Exit(2);
         }
