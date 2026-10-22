@@ -147,7 +147,8 @@ namespace ThinkBookFanControl
                 sb.AppendLine(string.Format("CPU：频率 {0:0} MHz，占用 {1:0.0} %，封装功耗 {2:0.0} W", r.CpuMhz, r.CpuUsage, r.CpuPowerW));
                 if (cpu.PowerUnavailable != null) sb.AppendLine("  功耗读取不可用：" + cpu.PowerUnavailable);
                 sb.AppendLine(string.Format("  PL1 / PL2：{0:0.#} / {1:0.#} W（来源：{2}）", r.Pl1W, r.Pl2W, cpu.LimitSource ?? "无"));
-                if (!double.IsNaN(r.MmioPl1W)) sb.AppendLine(string.Format("  MMIO PL1 / PL2：{0:0.#} / {1:0.#} W", r.MmioPl1W, r.MmioPl2W));
+                if (!double.IsNaN(r.MmioPl1W)) sb.AppendLine(string.Format("  MMIO（动态）PL1 / PL2：{0:0.#} / {1:0.#} W", r.MmioPl1W, r.MmioPl2W));
+                if (r.MmioLower) sb.AppendLine(string.Format("  实际生效：{0:0.#} / {1:0.#} W（每项取 MSR 和 MMIO 中较低的）", r.EffectivePl1W, r.EffectivePl2W));
                 sb.AppendLine("  可设置 PL1 / PL2：" + (cpu.CanWriteLimits ? "是" : "否（" + cpu.LimitsUnavailable + "）"));
                 if (!double.IsNaN(r.Pl1TauS)) sb.AppendLine(string.Format("  PL1 Tau：{0:0.###} 秒（可设置：{1}）", r.Pl1TauS, cpu.CanSetTau ? "是" : "否"));
             }

@@ -307,6 +307,9 @@ namespace ThinkBookFanControl
             {
                 sb.Append(r.Pl1W.ToString("0.#")).Append(" / ").Append(r.Pl2W.ToString("0.#")).Append(" W");
                 if (!double.IsNaN(r.Pl1TauS)) sb.Append(" · Tau ").Append(r.Pl1TauS.ToString("0.##")).Append(" 秒");
+                if (r.MmioLower)
+                    sb.Append(" · 动态 ").Append(r.MmioPl1W.ToString("0.#")).Append(" / ").Append(r.MmioPl2W.ToString("0.#"))
+                      .Append(" W，实际 ").Append(r.EffectivePl1W.ToString("0.#")).Append(" / ").Append(r.EffectivePl2W.ToString("0.#")).Append(" W");
             }
             if (!cpu.CanWriteLimits) sb.Append("（不支持设置：").Append(cpu.LimitsUnavailable).Append('）');
             else sb.Append("（自定义：").Append(on ? "开" : "关").Append("，设定 ").Append(pl1).Append(" / ").Append(pl2).Append(" W，Tau ").Append(tau).Append(" 秒）");
@@ -398,6 +401,9 @@ namespace ThinkBookFanControl
                       .Append(",\"unit\":").Append(J(_fans[i].Unit)).Append('}');
                 sb.Append("],\"failsafe\":").Append(r.Failsafe ? "true" : "false");
                 sb.Append(",\"powerLimits\":{\"pl1W\":").Append(J(r.Pl1W)).Append(",\"pl2W\":").Append(J(r.Pl2W)).Append(",\"tauS\":").Append(J(r.Pl1TauS))
+                  .Append(",\"mmioPl1W\":").Append(J(r.MmioPl1W)).Append(",\"mmioPl2W\":").Append(J(r.MmioPl2W))
+                  .Append(",\"effectivePl1W\":").Append(J(r.EffectivePl1W)).Append(",\"effectivePl2W\":").Append(J(r.EffectivePl2W))
+                  .Append(",\"mmioChange\":").Append(J(r.MmioChange))
                   .Append(",\"custom\":").Append(plOn ? "true" : "false").Append(",\"setPl1W\":").Append(pl1).Append(",\"setPl2W\":").Append(pl2).Append(",\"setTauS\":").Append(tau)
                   .Append(",\"writable\":").Append(_controller.Cpu.CanWriteLimits ? "true" : "false").Append('}');
                 sb.Append(",\"freq\":{\"enabled\":").Append(freqOn ? "true" : "false").Append(",\"allowBoost\":").Append(boost ? "true" : "false")

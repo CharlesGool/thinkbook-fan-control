@@ -981,16 +981,19 @@ namespace ThinkBookFanControl
             sb.Append("来源：").Append(cpu.LimitSource);
             if (!double.IsNaN(r.Pl1W)) sb.Append("\n当前：PL1 ").Append(r.Pl1W.ToString("0.#")).Append(" W · PL2 ").Append(r.Pl2W.ToString("0.#")).Append(" W");
             if (!double.IsNaN(r.Pl1TauS)) sb.Append(" · Tau ").Append(r.Pl1TauS.ToString(r.Pl1TauS < 10 ? "0.##" : "0")).Append(" 秒");
-            // The CPU enforces the lower of the MSR and MMIO copies. Intel DTT sets the MMIO copy per Fn+Q mode while it runs
-            // (measured ~55 / 75 W in balanced); with its extension component disabled it no longer follows Fn+Q at all
-            // (stayed 53 / 75 W through all three modes; 25 / 35 W, the BIOS default, right after disabling) and caps
-            // every higher MSR value. PawnIO's MCHBAR module is read-only, so only BIOS / DTT can raise it.
-            bool mmioLower = !double.IsNaN(r.MmioPl1W) && !double.IsNaN(r.Pl1W) && (r.MmioPl1W < r.Pl1W - 0.5 || r.MmioPl2W < r.Pl2W - 0.5);
+            // The CPU enforces PL1 and PL2 each as the lower of the MSR and MMIO copies. Intel DTT sets the MMIO copy per
+            // Fn+Q mode while it runs (measured ~55 / 75 W in balanced); with its extension component disabled it no longer
+            // follows Fn+Q at all (stayed 53 / 75 W through all three modes; 25 / 35 W, the BIOS default, right after
+            // disabling) and caps every higher MSR value. The EC also writes it (ACPI _Q48, 24 / 70 W at the temperature
+            // limit, see FanController.TrackMmio). PawnIO's MCHBAR module is read-only, so we cannot raise it.
+            bool mmioLower = r.MmioLower;
             if (!double.IsNaN(r.MmioPl1W))
-                sb.Append("\nMMIO：PL1 ").Append(r.MmioPl1W.ToString("0.#")).Append(" W · PL2 ").Append(r.MmioPl2W.ToString("0.#")).Append(" W（CPU 按两者中较低的生效）");
+                sb.Append("\nMMIO（动态）：PL1 ").Append(r.MmioPl1W.ToString("0.#")).Append(" W · PL2 ").Append(r.MmioPl2W.ToString("0.#")).Append(" W（CPU 每项按两者中较低的生效）");
             if (mmioLower)
-                sb.Append("\n⚠ 动态 PL（MMIO）更低，实际按它生效。它由 BIOS 开机写入，之后被联想进程管理服务和 Intel DTT 按模式改写，")
-                  .Append("本程序不能写：两者都停用后重启电脑，就保持 BIOS 里设的值。");
+                sb.Append("\n实际生效：PL1 ").Append(r.EffectivePl1W.ToString("0.#")).Append(" W · PL2 ").Append(r.EffectivePl2W.ToString("0.#")).Append(" W")
+                  .Append("\n⚠ 动态 PL 更低的那项按它生效。它由 BIOS 开机写入，之后 EC 会自己改写（到温度墙时改成 24 / 70 W，停用联想服务和 DTT 也会），")
+                  .Append("联想进程管理服务和 Intel DTT 运行时也按模式改写；本程序不能写它。");
+            if (r.MmioChange != null) sb.Append("\n动态 PL 最近一次变化：").Append(r.MmioChange);
             if (!cpu.CanWriteLimits) sb.Append("\n不支持设置：").Append(cpu.LimitsUnavailable);
             bool on; lock (_settings) on = _settings.PowerLimitEnabled;
             if (on && r.PowerLimitApplied) sb.Append("\n✓ 已应用自定义值");

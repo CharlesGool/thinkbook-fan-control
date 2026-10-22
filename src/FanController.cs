@@ -18,6 +18,12 @@ namespace ThinkBookFanControl
         public double CpuMhz, CpuUsage, CpuPowerW, Pl1W, Pl2W, Pl1TauS, MmioPl1W, MmioPl2W;
         public bool PowerLimitApplied;  // our PL1 / PL2 are in effect
         public string PowerLimitError;
+        public string MmioChange;       // last change of the MMIO copy since start ("time: old → new, temperature"), null = none
+
+        /// <summary>What the CPU enforces: PL1 and PL2 each the lower of the MSR and MMIO copies (MSR alone without MMIO).</summary>
+        public double EffectivePl1W { get { return double.IsNaN(MmioPl1W) ? Pl1W : Math.Min(Pl1W, MmioPl1W); } }
+        public double EffectivePl2W { get { return double.IsNaN(MmioPl2W) ? Pl2W : Math.Min(Pl2W, MmioPl2W); } }
+        public bool MmioLower { get { return !double.IsNaN(Pl1W) && (EffectivePl1W < Pl1W - 0.5 || EffectivePl2W < Pl2W - 0.5); } }
 
         // Windows power state and the frequency caps that apply to it right now (MHz, 0 = no limit, -1 = unknown)
         public PowerMode Mode;
@@ -74,6 +80,8 @@ namespace ThinkBookFanControl
         private long _plTriedAt = long.MinValue / 2;
         private string _plError;
         private bool _plWasBoosting;
+        private double _mmioPl1 = double.NaN, _mmioPl2 = double.NaN;
+        private string _mmioChange;
 
         private HwInfoPublisher _hwinfo;
         private long _hwinfoCheckedAt = long.MinValue / 2;
@@ -240,6 +248,7 @@ namespace ThinkBookFanControl
                 try { r.Rpm[i] = _backend.ReadFanRpm(_fans[i]); } catch (Exception) { r.Rpm[i] = -1; }
             }
             _cpu.Sample(r);
+            TrackMmio(r);
 
             // ---- snapshot settings
             FanMode mode; int[] fixedRpm, freqTable, freqMulti, eppTable; List<CurvePoint>[] curves; bool linkFixed, linkCurves, allowLow, rampOn, plOn, hwinfo, freqOn, dcTurbo, allowBoost, eppOn;
@@ -364,6 +373,25 @@ namespace ThinkBookFanControl
             if (!_stopped) ApplyEpp(r, eppOn, eppTable, now);
             Publish(r, hwinfo);
             Raise(r);
+        }
+
+        /// <summary>
+        /// Remember the last change of the MMIO copy of PL1 / PL2 and how hot the CPU was then. Besides the BIOS at boot
+        /// and Intel DTT, the EC writes it on its own: it puts PL1 / PL2 in its RAM (PL1V / PL2V) and raises ACPI event
+        /// _Q48, whose DSDT handler copies them ×8 into MCHBAR + 0x59A0 (CPL1 / CPL2) unless EC fields NSAP / MMCM are set
+        /// (the DSDT's thermal-mode code sets MMCM in one mode). On the ThinkBook 14+ 2025 it wrote 24 / 70 W at the temperature
+        /// limit with the Lenovo service and the DTT component both disabled. Nothing here can write MMIO back.
+        /// </summary>
+        private void TrackMmio(Reading r)
+        {
+            if (!double.IsNaN(r.MmioPl1W))
+            {
+                if (!double.IsNaN(_mmioPl1) && (Math.Abs(r.MmioPl1W - _mmioPl1) >= 0.5 || Math.Abs(r.MmioPl2W - _mmioPl2) >= 0.5))
+                    _mmioChange = string.Format("{0:HH:mm:ss} 由 {1:0.#} / {2:0.#} W 改为 {3:0.#} / {4:0.#} W{5}", DateTime.Now,
+                        _mmioPl1, _mmioPl2, r.MmioPl1W, r.MmioPl2W, r.Temp >= 0 ? "，当时 CPU " + r.Temp + "°C" : "");
+                _mmioPl1 = r.MmioPl1W; _mmioPl2 = r.MmioPl2W;
+            }
+            r.MmioChange = _mmioChange;
         }
 
         /// <summary>
