@@ -381,8 +381,9 @@ namespace ThinkBookFanControl
         /// Remember the last change of the MMIO copy of PL1 / PL2 and how hot the CPU was then. Besides the BIOS at boot
         /// and Intel DTT, the EC writes it on its own: it puts PL1 / PL2 in its RAM (PL1V / PL2V) and raises ACPI event
         /// _Q48, whose DSDT handler copies them ×8 into MCHBAR + 0x59A0 (CPL1 / CPL2) unless EC fields NSAP / MMCM are set
-        /// (the DSDT's thermal-mode code sets MMCM in one mode). On the ThinkBook 14+ 2025 it wrote 24 / 70 W at the temperature
-        /// limit with the Lenovo service and the DTT component both disabled. Nothing here can write MMIO back.
+        /// (DYTC sets MMCM = 2 / 3 in Lenovo's performance / low-power modes, 0 in balanced). On the ThinkBook 14+ 2025 it
+        /// was seen at 24 / 70 W when Lenovo's service stopped; full load at the temperature limit (PL 130 / 150 W,
+        /// 101–104 °C for 8 minutes) did not trigger it. Nothing here can write MMIO back.
         /// </summary>
         private void TrackMmio(Reading r)
         {
