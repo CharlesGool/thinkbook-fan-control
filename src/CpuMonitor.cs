@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Management;
 using System.Runtime.InteropServices;
@@ -14,6 +15,8 @@ namespace ThinkBookFanControl
         private PdhQuery _pdh;
         private int _perf = -1, _freq = -1, _util = -1;
         private readonly BusyCoreMeter _busy;
+        private readonly CpuCores _cores;
+        private bool _coreTemps = true;   // cleared once if MSR 0x19C is refused
         private readonly MsrPower _msr;
         private readonly WmiPowerLimits _wmi;
         private readonly string _msrError;
@@ -34,6 +37,7 @@ namespace ThinkBookFanControl
             }
             catch (Exception) { _pdh = null; }
             try { _busy = new BusyCoreMeter(); } catch (Exception) { }
+            try { _cores = new CpuCores(); } catch (Exception) { }
 
             try
             {
@@ -78,6 +82,7 @@ namespace ThinkBookFanControl
         public void Sample(Reading r)
         {
             r.CpuMhz = r.CpuUsage = r.CpuPowerW = r.Pl1W = r.Pl2W = r.Pl1TauS = r.MmioPl1W = r.MmioPl2W = double.NaN;
+            r.CoreTempAvg = r.CoreTempMax = r.PCoreMhz = r.ECoreMhz = double.NaN;
             if (_pdh != null && _pdh.Collect())
             {
                 double perf = _pdh.Get(_perf), freq = _pdh.Get(_freq), util = _pdh.Get(_util);
@@ -85,6 +90,15 @@ namespace ThinkBookFanControl
                 r.CpuUsage = double.IsNaN(util) ? util : Math.Max(0, Math.Min(100, util));
             }
             if (_busy != null) r.BusyCores = _busy.Sample();
+            if (_cores != null)
+            {
+                _cores.SampleFrequencies(r);
+                if (_msr != null && _coreTemps)
+                {
+                    try { _cores.SampleTemperatures(_msr, r); }
+                    catch (Exception) { _coreTemps = false; }
+                }
+            }
             if (_msr != null)
             {
                 try { r.CpuPowerW = _msr.PackagePower(); } catch (Exception) { }
@@ -159,6 +173,7 @@ namespace ThinkBookFanControl
         public void Dispose()
         {
             if (_pdh != null) { _pdh.Dispose(); _pdh = null; }
+            if (_cores != null) _cores.Dispose();
             if (_msr != null) _msr.Dispose();
         }
     }
@@ -240,6 +255,114 @@ namespace ThinkBookFanControl
     }
 
     /// <summary>
+    /// Per-core readings: frequency per core type (P / E, from GetSystemCpuSetInformation's EfficiencyClass: the highest
+    /// class is P) as the average of each logical processor's "% Processor Performance" × "Processor Frequency", and
+    /// the DTS temperature of every core (MSR 0x19C, read on that core by pinning this thread to it).
+    /// </summary>
+    internal sealed class CpuCores : IDisposable
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct GroupAffinity { public UIntPtr Mask; public ushort Group; public ushort R0, R1, R2; }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetSystemCpuSetInformation(byte[] info, int length, out int returned, IntPtr process, int flags);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetThreadGroupAffinity(IntPtr thread, ref GroupAffinity affinity, out GroupAffinity previous);
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GetCurrentThread();
+
+        private readonly ushort[] _group;
+        private readonly byte[] _index, _core;
+        private readonly bool[] _big;
+        public readonly bool Hybrid;
+        private PdhQuery _pdh;
+        private readonly int[] _perf, _freq;
+
+        public CpuCores()
+        {
+            int len;
+            GetSystemCpuSetInformation(null, 0, out len, IntPtr.Zero, 0);
+            var buf = new byte[len];
+            if (!GetSystemCpuSetInformation(buf, len, out len, IntPtr.Zero, 0)) throw new InvalidOperationException("GetSystemCpuSetInformation");
+            var g = new List<ushort>(); var ix = new List<byte>(); var core = new List<byte>(); var cls = new List<byte>();
+            for (int p = 0; p + 24 <= len; )
+            {
+                int size = BitConverter.ToInt32(buf, p);
+                if (size <= 0) break;
+                if (BitConverter.ToInt32(buf, p + 4) == 0) // CpuSetInformation
+                {
+                    g.Add(BitConverter.ToUInt16(buf, p + 12)); ix.Add(buf[p + 14]); core.Add(buf[p + 15]); cls.Add(buf[p + 18]);
+                }
+                p += size;
+            }
+            if (g.Count == 0) throw new InvalidOperationException("no CPU sets");
+            _group = g.ToArray(); _index = ix.ToArray(); _core = core.ToArray();
+            byte top = 0, low = 255;
+            foreach (byte c in cls) { top = Math.Max(top, c); low = Math.Min(low, c); }
+            Hybrid = top != low;
+            _big = new bool[cls.Count];
+            for (int i = 0; i < cls.Count; i++) _big[i] = cls[i] == top;
+
+            _pdh = new PdhQuery();
+            _perf = new int[_group.Length]; _freq = new int[_group.Length];
+            for (int i = 0; i < _group.Length; i++)
+            {
+                string inst = _group[i] + "," + _index[i];
+                _perf[i] = _pdh.Add(@"\Processor Information(" + inst + @")\% Processor Performance");
+                _freq[i] = _pdh.Add(@"\Processor Information(" + inst + @")\Processor Frequency");
+            }
+            _pdh.Collect();
+        }
+
+        public void SampleFrequencies(Reading r)
+        {
+            if (_pdh == null || !_pdh.Collect()) return;
+            double pSum = 0, eSum = 0; int pN = 0, eN = 0;
+            for (int i = 0; i < _group.Length; i++)
+            {
+                double mhz = _pdh.Get(_perf[i]) * _pdh.Get(_freq[i]) / 100;
+                if (double.IsNaN(mhz)) continue;
+                if (_big[i]) { pSum += mhz; pN++; } else { eSum += mhz; eN++; }
+            }
+            if (pN > 0) r.PCoreMhz = pSum / pN;
+            if (Hybrid && eN > 0) r.ECoreMhz = eSum / eN;
+        }
+
+        /// <summary>Throws when MSR 0x19C cannot be read (the caller then stops trying).</summary>
+        public void SampleTemperatures(MsrPower msr, Reading r)
+        {
+            var thread = GetCurrentThread();
+            GroupAffinity saved = default(GroupAffinity);
+            bool pinned = false;
+            double sum = 0, max = double.NaN; int n = 0;
+            var seen = new HashSet<int>();
+            try
+            {
+                for (int i = 0; i < _group.Length; i++)
+                {
+                    if (!seen.Add(_group[i] << 8 | _core[i])) continue; // one reading per physical core
+                    var a = new GroupAffinity { Mask = (UIntPtr)(1UL << _index[i]), Group = _group[i] };
+                    GroupAffinity prev;
+                    if (!SetThreadGroupAffinity(thread, ref a, out prev)) continue;
+                    if (!pinned) { saved = prev; pinned = true; }
+                    double t = msr.CoreTemp();
+                    if (double.IsNaN(t)) continue;
+                    sum += t; n++;
+                    if (double.IsNaN(max) || t > max) max = t;
+                }
+            }
+            finally
+            {
+                GroupAffinity ignored;
+                if (pinned) SetThreadGroupAffinity(thread, ref saved, out ignored);
+            }
+            if (n > 0) { r.CoreTempAvg = sum / n; r.CoreTempMax = max; }
+        }
+
+        public void Dispose() { if (_pdh != null) { _pdh.Dispose(); _pdh = null; } }
+    }
+
+    /// <summary>
     /// Intel RAPL through PawnIO's IntelMSR module: 0x606 units, 0x610 PKG_POWER_LIMIT (PL1 bits 14:0 + enable 15,
     /// PL1 time window "Tau" bits 23:17, PL2 bits 46:32 + enable 47, lock 63), 0x611 package energy counter. The MMIO
     /// mirror at MCHBAR + 0x59A0 is read (IntelMCHBAR module, read-only) to show it: the CPU enforces the lower of the
@@ -280,6 +403,19 @@ namespace ThinkBookFanControl
 
         /// <summary>Highest single-core turbo frequency (MSR 0x1AD), 0 when unknown.</summary>
         public readonly int MaxTurboMhz;
+
+        private int _tjMax = -1;
+
+        /// <summary>
+        /// DTS temperature of the core this thread runs on (MSR 0x19C: TjMax − bits 22:16, valid bit 31), NaN when not
+        /// valid. TjMax is MSR 0x1A2 bits 23:16 (105 °C on the ThinkBook 14+ 2025's Core Ultra 9 285H). Throws when refused.
+        /// </summary>
+        public double CoreTemp()
+        {
+            if (_tjMax < 0) _tjMax = (int)((Read(0x1A2) >> 16) & 0xFF);
+            ulong v = Read(0x19C);
+            return (v >> 31 & 1) == 0 ? double.NaN : _tjMax - (int)((v >> 16) & 0x7F);
+        }
 
         private ulong Read(uint msr) { return (ulong)_msr.Execute("ioctl_read_msr", new long[] { msr }, 1)[0]; }
 

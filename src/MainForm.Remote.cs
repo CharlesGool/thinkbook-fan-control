@@ -346,7 +346,9 @@ namespace ThinkBookFanControl
             sb.Append("模式：").Append(ModeName(mode, true)).Append(mode == FanMode.Curve ? "（" + profile + "）" : "").Append('\n');
             if (r == null) return sb.Append("（还没有读数）\n").ToString();
             sb.Append("CPU：").Append(r.Temp >= 0 ? r.Temp + " °C" : "--")
+              .Append(double.IsNaN(r.CoreTempAvg) ? "" : "（核心平均 " + r.CoreTempAvg.ToString("0") + " / 最高 " + r.CoreTempMax.ToString("0") + " °C）")
               .Append(" · ").Append(double.IsNaN(r.CpuMhz) ? "--" : (r.CpuMhz / 1000).ToString("0.00") + " GHz")
+              .Append(double.IsNaN(r.PCoreMhz) ? "" : "（大核 " + (r.PCoreMhz / 1000).ToString("0.00") + (double.IsNaN(r.ECoreMhz) ? "" : " / 小核 " + (r.ECoreMhz / 1000).ToString("0.00")) + " GHz）")
               .Append(" · 占用 ").Append(double.IsNaN(r.CpuUsage) ? "--" : r.CpuUsage.ToString("0") + " %")
               .Append(" · 功耗 ").Append(double.IsNaN(r.CpuPowerW) ? "--" : r.CpuPowerW.ToString("0.0") + " W").Append('\n');
             for (int i = 0; i < _fans.Count; i++)
@@ -393,7 +395,9 @@ namespace ThinkBookFanControl
             if (r != null)
             {
                 sb.Append(",\"cpu\":{\"tempC\":").Append(r.Temp >= 0 ? r.Temp.ToString() : "null").Append(",\"mhz\":").Append(J(r.CpuMhz))
-                  .Append(",\"usage\":").Append(J(r.CpuUsage)).Append(",\"powerW\":").Append(J(r.CpuPowerW)).Append('}');
+                  .Append(",\"usage\":").Append(J(r.CpuUsage)).Append(",\"powerW\":").Append(J(r.CpuPowerW))
+                  .Append(",\"coreTempAvgC\":").Append(J(r.CoreTempAvg)).Append(",\"coreTempMaxC\":").Append(J(r.CoreTempMax))
+                  .Append(",\"pCoreMhz\":").Append(J(r.PCoreMhz)).Append(",\"eCoreMhz\":").Append(J(r.ECoreMhz)).Append('}');
                 sb.Append(",\"fans\":[");
                 for (int i = 0; i < _fans.Count; i++)
                     sb.Append(i > 0 ? "," : "").Append("{\"name\":").Append(J(_fans[i].Name)).Append(",\"rpm\":").Append(r.Rpm[i] >= 0 ? r.Rpm[i].ToString() : "null")

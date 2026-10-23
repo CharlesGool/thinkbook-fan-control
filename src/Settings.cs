@@ -229,7 +229,7 @@ namespace ThinkBookFanControl
             if (kv.TryGetValue("AllowLowSpeed", out v)) s.AllowLowSpeed = v == "1";
             s.HysteresisC = Int(kv, "HysteresisC", s.HysteresisC, 0, 15);
             s.SmoothingSec = Int(kv, "SmoothingSec", s.SmoothingSec, 1, 30);
-            s.CriticalTempC = Int(kv, "CriticalTempC", s.CriticalTempC, 75, 100);
+            s.CriticalTempC = Int(kv, "CriticalTempC", s.CriticalTempC, 75, 110);
             s.LowSpeedMaxTempC = Int(kv, "LowSpeedMaxTempC", s.LowSpeedMaxTempC, 35, 70);
             if (kv.TryGetValue("RampEnabled", out v)) s.RampEnabled = v == "1";
             s.RampUpRpmPerSec = Int(kv, "RampUpRpmPerSec", s.RampUpRpmPerSec, RampMin, RampMax);

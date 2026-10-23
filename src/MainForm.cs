@@ -127,11 +127,11 @@ namespace ThinkBookFanControl
             var status = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = true, BackColor = Color.White, Padding = Pd(8, 6, 8, 6), Margin = Pd(0, 0, 0, 8) };
             root.Controls.Add(status, 0, 0);
             root.SetColumnSpan(status, 2);
-            _tempLabel = Tile(status, "CPU 温度", Palette.Temp);
-            _freqLabel = Tile(status, "CPU 频率", Palette.Text);
+            _tempLabel = Tile(status, "CPU 温度 平均 / 最高", Palette.Temp);
+            _freqLabel = Tile(status, "频率 大核 / 小核", Palette.Text);
             _usageLabel = Tile(status, "CPU 占用", Palette.Text);
             _powerLabel = Tile(status, "CPU 功耗", Palette.Power);
-            _plLabel = Tile(status, "PL1 / PL2", Palette.Text);
+            _plLabel = Tile(status, "实际 PL1 / PL2", Palette.Text);
             _rpmLabels = new Label[_fans.Count];
             _targetLabels = new Label[_fans.Count];
             for (int i = 0; i < _fans.Count; i++)
@@ -145,6 +145,9 @@ namespace ThinkBookFanControl
             var tips = new ToolTip();
             if (cpu.PowerUnavailable != null) tips.SetToolTip(_powerLabel, "无法读取：" + cpu.PowerUnavailable);
             if (cpu.LimitSource == null) tips.SetToolTip(_plLabel, "无法读取：" + cpu.LimitsUnavailable);
+            else tips.SetToolTip(_plLabel, "CPU 实际执行的限制：PL1、PL2 各取静态（MSR）和动态（MMIO）中较低的值");
+            tips.SetToolTip(_tempLabel, "所有核心温度（MSR 0x19C）的平均值和最高值；读不到时显示风扇控制用的 CPU 温度");
+            tips.SetToolTip(_freqLabel, "大核（P 核）和小核（E 核）各自的平均频率");
             _statusLabel = new Label { AutoSize = true, ForeColor = Palette.Text, Margin = Pd(12, 14, 0, 0), MaximumSize = Sz(360, 0) };
             status.Controls.Add(_statusLabel);
 
@@ -412,7 +415,7 @@ namespace ThinkBookFanControl
                 AutoSize = true, MaximumSize = Sz(280, 0), Margin = Pd(3, 4, 3, 4),
                 ForeColor = Program.ModelVerified ? Palette.Text : Color.FromArgb(180, 83, 9)
             });
-            _critical = Num(Row(genFlow, "高温保护 (°C)，达到即全速"), 75, 100);
+            _critical = Num(Row(genFlow, "高温保护 (°C)，达到即全速"), 75, 110);
             _critical.ValueChanged += (s, e) => { if (_loading) return; lock (_settings) _settings.CriticalTempC = (int)_critical.Value; Changed(); };
             _allowLow = Check(genFlow, "允许低于额定最低转速 / 停转");
             _allowLow.CheckedChanged += (s, e) => { if (!_loading) SetAllowLow(_allowLow.Checked); };
@@ -930,11 +933,14 @@ namespace ThinkBookFanControl
             int every; lock (_settings) every = _settings.UiRefreshMs;
             if (!r.Failsafe && now - _uiShownAt < every - 100) return;
             _uiShownAt = now;
-            _tempLabel.Text = r.Temp >= 0 ? r.Temp + " °C" : "--";
-            SetText(_freqLabel, double.IsNaN(r.CpuMhz) ? "--" : (r.CpuMhz / 1000).ToString("0.00") + " GHz");
+            SetText(_tempLabel, !double.IsNaN(r.CoreTempAvg) ? r.CoreTempAvg.ToString("0") + " / " + r.CoreTempMax.ToString("0") + " °C"
+                : r.Temp >= 0 ? r.Temp + " °C" : "--");
+            SetText(_freqLabel, !double.IsNaN(r.PCoreMhz)
+                ? (r.PCoreMhz / 1000).ToString("0.00") + (double.IsNaN(r.ECoreMhz) ? "" : " / " + (r.ECoreMhz / 1000).ToString("0.00")) + " GHz"
+                : double.IsNaN(r.CpuMhz) ? "--" : (r.CpuMhz / 1000).ToString("0.00") + " GHz");
             SetText(_usageLabel, double.IsNaN(r.CpuUsage) ? "--" : r.CpuUsage.ToString("0") + " %");
             SetText(_powerLabel, double.IsNaN(r.CpuPowerW) ? "--" : r.CpuPowerW.ToString("0.0") + " W");
-            SetText(_plLabel, double.IsNaN(r.Pl1W) ? "--" : r.Pl1W.ToString("0.#") + " / " + r.Pl2W.ToString("0.#") + " W");
+            SetText(_plLabel, double.IsNaN(r.Pl1W) ? "--" : r.EffectivePl1W.ToString("0.#") + " / " + r.EffectivePl2W.ToString("0.#") + " W");
             UpdatePowerInfo(r);
             UpdateFreqInfo(r);
             UpdateEppInfo(r);

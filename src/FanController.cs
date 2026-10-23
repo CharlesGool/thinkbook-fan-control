@@ -33,6 +33,8 @@ namespace ThinkBookFanControl
         public bool FreqBoosting, PowerBoosting; // the system raised caps / PL after an app launch (allowed, restored afterwards)
         public int BoostSecondsLeft;    // app-launch boost window, 0 = none
         public double BusyCores = double.NaN; // busy time of all logical processors added up, in cores (NaN = unknown)
+        public double CoreTempAvg = double.NaN, CoreTempMax = double.NaN; // per-core DTS temperatures (MSR 0x19C), °C
+        public double PCoreMhz = double.NaN, ECoreMhz = double.NaN;      // average per core type; E = NaN on non-hybrid CPUs
         public bool MultiCoreLoad;      // the all-core-load frequency caps are in use
         public int EppNow = -1;         // EPP that applies right now (0 = performance .. 100 = efficiency), -1 = unknown
         public int EppCorrections;      // EPP values somebody else changed back within the last minute

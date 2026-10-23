@@ -25,7 +25,7 @@ namespace ThinkBookFanControl
     /// <summary>Temperature → RPM curve editor. Drag points, double-click to add, right-click to delete.</summary>
     public class CurveEditor : Control
     {
-        public const int TempMin = 20, TempMax = 100;
+        public const int TempMin = 20, TempMax = 110; // the CPU's temperature limit is 105–110 °C
 
         private List<CurvePoint>[] _curves;
         private FanInfo[] _fans;
@@ -268,7 +268,7 @@ namespace ThinkBookFanControl
 
     /// <summary>
     /// Rolling history: fan RPM (or target % for fans without a speed sensor) on the left axis, CPU temperature and
-    /// package power on the right axis (°C / W share one scale; 20–100 °C when there is no power reading).
+    /// package power on the right axis (°C / W share one scale; 30–110 °C when there is no power reading).
     /// </summary>
     public class HistoryView : Control
     {
@@ -311,11 +311,11 @@ namespace ThinkBookFanControl
             g.SmoothingMode = SmoothingMode.AntiAlias;
             var p = new Rectangle(Scale(56), Scale(24), Math.Max(10, Width - Scale(56) - Scale(56)), Math.Max(10, Height - Scale(24) - Scale(22)));
 
-            // Right axis: 20..100 °C, or 0..R shared by °C and W once a power reading exists.
+            // Right axis: 30..110 °C, or 0..R (at least 120) shared by °C and W once a power reading exists.
             double maxPower = double.NaN;
             foreach (double w in _power) if (!double.IsNaN(w)) maxPower = double.IsNaN(maxPower) ? w : Math.Max(maxPower, w);
             bool power = !double.IsNaN(maxPower);
-            int rLo = power ? 0 : 20, rHi = power ? Math.Max(100, (int)Math.Ceiling(maxPower / 20) * 20) : 100;
+            int rLo = power ? 0 : 30, rHi = power ? Math.Max(120, (int)Math.Ceiling(maxPower / 20) * 20) : 110;
 
             using (var gridPen = new Pen(Palette.Grid))
             using (var axisPen = new Pen(Palette.Axis))
